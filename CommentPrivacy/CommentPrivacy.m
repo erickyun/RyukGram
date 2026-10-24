@@ -1,13 +1,15 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // Independent experimental Instagram tweak. RyukGram itself is not modified.
 static NSString *const kNames = @"CPHideCommentUsernames";
 static NSString *const kAvatars = @"CPHideCommentAvatars";
-static char kGesture, kPriorAlpha;
-static IMP originalMove, originalTableLayout, originalCollectionLayout;
-static IMP originalSetLabel, originalSetIdentifier;
+static char kGesture, kPriorAlpha, kInlineOriginal, kInlineRendered;
+static IMP originalMove, originalTableLayout, originalCollectionLayout, originalAnyLayout;
+static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
+static BOOL changingRenderedText = NO;
 
 static NSString *lower(NSString *s) {
     return [[s ?: @"" lowercaseString] stringByTrimmingCharactersInSet:
@@ -48,7 +50,8 @@ static BOOL commentRow(UIView *v) {
     NSString *name = lower(NSStringFromClass([v class]));
     BOOL comment = [name containsString:@"comment"] || [name containsString:@"yorum"];
     BOOL row = [name containsString:@"cell"] || [name containsString:@"row"] ||
-               [name containsString:@"item"];
+               [name containsString:@"item"] || [name containsString:@"commentnode"] ||
+               [name hasSuffix:@"commentview"];
     BOOL excluded = [name containsString:@"button"] || [name containsString:@"header"] ||
                     [name containsString:@"footer"] || [name containsString:@"composer"] ||
                     [name containsString:@"input"] || [name containsString:@"preview"];
@@ -65,19 +68,111 @@ static void privateAlpha(UIView *v, BOOL hide) {
         objc_setAssociatedObject(v, &kPriorAlpha, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
-static void collect(UIView *v, NSMutableArray<UILabel *> *labels,
+// Modern Instagram comments can display the bold username and the comment body
+// in the SAME attributed view. The original implementation only hid UILabel
+// instances containing an entire username; it could never hide an inline author.
+static BOOL cpTextView(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]] || [v isKindOfClass:[UITextView class]])
+        return YES;
+    NSString *cls = lower(NSStringFromClass([v class]));
+    if (![cls containsString:@"text"] && ![cls containsString:@"label"] &&
+        ![cls containsString:@"styled"]) return NO;
+    return [v respondsToSelector:@selector(attributedText)] ||
+           [v respondsToSelector:NSSelectorFromString(@"attributedString")] ||
+           [v respondsToSelector:@selector(text)];
+}
+static NSAttributedString *cpAttributed(UIView *v) {
+    for (NSString *key in @[@"attributedText", @"attributedString"]) {
+        SEL getter = NSSelectorFromString(key);
+        if (![v respondsToSelector:getter]) continue;
+        @try {
+            id result = ((id (*)(id, SEL))objc_msgSend)(v, getter);
+            if ([result isKindOfClass:[NSAttributedString class]]) return result;
+        } @catch (NSException *exception) {}
+    }
+    return nil;
+}
+static NSString *cpString(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        return l.text ?: l.attributedText.string;
+    }
+    if ([v isKindOfClass:[UITextView class]]) {
+        UITextView *t = (UITextView *)v;
+        return t.text ?: t.attributedText.string;
+    }
+    SEL getter = @selector(text);
+    if ([v respondsToSelector:getter]) {
+        @try {
+            id result = ((id (*)(id, SEL))objc_msgSend)(v, getter);
+            if ([result isKindOfClass:[NSString class]]) return result;
+        } @catch (NSException *exception) {}
+    }
+    return cpAttributed(v).string;
+}
+static BOOL cpSetAttributed(UIView *v, NSAttributedString *value) {
+    for (NSString *name in @[@"setAttributedText:", @"setAttributedString:"]) {
+        SEL setter = NSSelectorFromString(name);
+        if (![v respondsToSelector:setter]) continue;
+        @try {
+            changingRenderedText = YES;
+            ((void (*)(id, SEL, id))objc_msgSend)(v, setter, value);
+            changingRenderedText = NO;
+            return YES;
+        } @catch (NSException *exception) {
+            changingRenderedText = NO;
+        }
+    }
+    return NO;
+}
+static NSAttributedString *cpOriginalAttributed(UIView *v) {
+    NSAttributedString *current = cpAttributed(v);
+    NSAttributedString *stored = objc_getAssociatedObject(v, &kInlineOriginal);
+    NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
+    if (stored && rendered && current && [current isEqualToAttributedString:rendered])
+        return stored;
+    if (stored) {
+        objc_setAssociatedObject(v, &kInlineOriginal, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(v, &kInlineRendered, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return current;
+}
+static void cpRestoreInline(UIView *v) {
+    NSAttributedString *original = objc_getAssociatedObject(v, &kInlineOriginal);
+    NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
+    if (!original) return;
+    BOOL unchanged = rendered && [cpAttributed(v) isEqualToAttributedString:rendered];
+    objc_setAssociatedObject(v, &kInlineOriginal, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(v, &kInlineRendered, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (unchanged) cpSetAttributed(v, original);
+}
+static void cpReplaceInline(UIView *v, NSAttributedString *original, NSRange prefix) {
+    if (!original || prefix.length == 0 || NSMaxRange(prefix) >= original.length) return;
+    NSMutableAttributedString *masked = [original mutableCopy];
+    [masked deleteCharactersInRange:prefix];
+    NSAttributedString *result = [masked copy];
+    NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
+    if (rendered && [cpAttributed(v) isEqualToAttributedString:result]) return;
+    objc_setAssociatedObject(v, &kInlineOriginal, [original copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(v, &kInlineRendered, result, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!cpSetAttributed(v, result)) cpRestoreInline(v);
+}
+static void collect(UIView *v, NSMutableArray<UIView *> *texts,
                     NSMutableArray<UIView *> *images, NSUInteger depth) {
-    if (depth > 9) return;
+    if (depth > 12) return;
     for (UIView *c in v.subviews) {
-        if ([c isKindOfClass:[UILabel class]]) [labels addObject:(UILabel *)c];
+        if (cpTextView(c)) [texts addObject:c];
         NSString *cls = lower(NSStringFromClass([c class]));
         if ([c isKindOfClass:[UIImageView class]] || [cls containsString:@"avatar"] ||
             [cls containsString:@"profilepicture"] || [cls containsString:@"profileimage"])
             [images addObject:c];
-        collect(c, labels, images, depth + 1);
+        collect(c, texts, images, depth + 1);
     }
 }
-static BOOL username(NSString *s) {
+static BOOL username(NSString *value) {
+    NSString *s = [value stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([s hasPrefix:@"@"]) s = [s substringFromIndex:1];
     if (s.length == 0 || s.length > 30) return NO;
     static NSCharacterSet *valid;
     static dispatch_once_t once;
@@ -89,13 +184,50 @@ static BOOL username(NSString *s) {
     if ([s rangeOfCharacterFromSet:NSCharacterSet.letterCharacterSet].location == NSNotFound)
         return NO;
     return ![@[@"reply", @"like", @"likes", @"view", @"more", @"edited", @"follow",
-                @"author", @"yanıtla", @"beğen", @"takip"] containsObject:lower(s)];
+                @"author", @"yanıtla", @"beğen", @"takip", @"translate",
+                @"replies", @"comments", @"ago"] containsObject:lower(s)];
+}
+static BOOL cpBoldFont(id font) {
+    if (![font isKindOfClass:[UIFont class]]) return NO;
+    UIFont *f = font;
+    BOOL trait = (f.fontDescriptor.symbolicTraits & UIFontDescriptorTraitBold) != 0;
+    NSString *fontName = lower(f.fontName);
+    return trait || [fontName containsString:@"bold"] ||
+           [fontName containsString:@"semibold"] || [fontName containsString:@"demi"];
+}
+// Returns the range to delete ONLY when the author is a distinct styled prefix.
+static NSRange cpAuthorPrefix(NSAttributedString *text) {
+    if (!text || text.length < 4) return NSMakeRange(NSNotFound, 0);
+    NSString *s = text.string;
+    NSUInteger i = 0;
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    while (i < s.length && [ws characterIsMember:[s characterAtIndex:i]]) i++;
+    NSUInteger start = i;
+    if (start > 2) return NSMakeRange(NSNotFound, 0);
+    while (i < s.length && ![ws characterIsMember:[s characterAtIndex:i]] &&
+           i - start <= 31) i++;
+    if (i == s.length || !username([s substringWithRange:NSMakeRange(start, i - start)]))
+        return NSMakeRange(NSNotFound, 0);
+    NSUInteger wordEnd = i;
+    while (i < s.length && [ws characterIsMember:[s characterAtIndex:i]]) i++;
+    if (i == s.length || i == wordEnd) return NSMakeRange(NSNotFound, 0);
+    // A username must have a different style/link than the actual comment body.
+    NSUInteger authorIndex = start;
+    NSUInteger bodyIndex = i;
+    UIFont *beforeFont = [text attribute:NSFontAttributeName atIndex:authorIndex effectiveRange:NULL];
+    UIFont *bodyFont = [text attribute:NSFontAttributeName atIndex:bodyIndex effectiveRange:NULL];
+    id authorLink = [text attribute:NSLinkAttributeName atIndex:authorIndex effectiveRange:NULL];
+    id bodyLink = [text attribute:NSLinkAttributeName atIndex:bodyIndex effectiveRange:NULL];
+    BOOL styledAuthor = (cpBoldFont(beforeFont) && !cpBoldFont(bodyFont)) ||
+                        (authorLink && !bodyLink);
+    if (!styledAuthor) return NSMakeRange(NSNotFound, 0);
+    return NSMakeRange(0, i);
 }
 static void applyRow(UIView *row) {
-    if (!commentRow(row)) return;
-    NSMutableArray<UILabel *> *labels = [NSMutableArray array];
+    if (changingRenderedText || !commentRow(row)) return;
+    NSMutableArray<UIView *> *texts = [NSMutableArray array];
     NSMutableArray<UIView *> *images = [NSMutableArray array];
-    collect(row, labels, images, 0);
+    collect(row, texts, images, 0);
     UIView *avatar = nil;
     CGFloat bestAvatar = CGFLOAT_MAX;
     for (UIView *v in images) {
@@ -107,33 +239,50 @@ static void applyRow(UIView *row) {
         CGFloat score = CGRectGetMinX(r) + 1.5 * CGRectGetMinY(r) + fabs(w - h);
         if (score < bestAvatar) { avatar = v; bestAvatar = score; }
     }
-    UILabel *author = nil;
+    UIView *author = nil;
+    BOOL inlineAuthor = NO;
+    NSRange authorPrefix = NSMakeRange(NSNotFound, 0);
+    NSAttributedString *authorOriginal = nil;
     CGFloat bestAuthor = CGFLOAT_MAX;
     CGRect avatarRect = avatar ? [avatar convertRect:avatar.bounds toView:row] : CGRectNull;
-    for (UILabel *v in labels) {
-        NSString *s = v.text ?: v.attributedText.string;
-        if (!username(s)) continue;
+    for (UIView *v in texts) {
+        NSAttributedString *original = cpOriginalAttributed(v);
+        NSString *s = original.string ?: cpString(v);
+        BOOL isolated = username(s);
+        NSRange prefix = isolated ? NSMakeRange(NSNotFound, 0) : cpAuthorPrefix(original);
+        if (!isolated && prefix.location == NSNotFound) continue;
         CGRect r = [v convertRect:v.bounds toView:row];
-        if (CGRectGetMinY(r) < -5 || CGRectGetMinY(r) > 110) continue;
-        CGFloat score = CGRectGetMinY(r) + 0.2 * CGRectGetMinX(r);
+        if (CGRectGetMinY(r) < -8 || CGRectGetMinY(r) > 120) continue;
+        CGFloat score = CGRectGetMinY(r) + 0.15 * CGRectGetMinX(r);
+        if (!isolated) score += 25; // A standalone author label is more trustworthy.
         if (avatar) {
             CGFloat dx = CGRectGetMinX(r) - CGRectGetMaxX(avatarRect);
-            CGFloat dy = fabs(CGRectGetMidY(r) - CGRectGetMidY(avatarRect));
-            if (dx < -8 || dx > 85 || dy > 45) continue;
-            score = dy + 0.5 * fabs(dx - 12);
+            CGFloat dy = fabs(CGRectGetMinY(r) - CGRectGetMinY(avatarRect));
+            if (dx < -15 || dx > 145 || dy > 65) continue;
+            score = dy + 0.2 * fabs(dx - 12) + (isolated ? 0 : 25);
         }
-        if (score < bestAuthor) { author = v; bestAuthor = score; }
+        if (score < bestAuthor) {
+            bestAuthor = score;
+            author = v;
+            inlineAuthor = !isolated;
+            authorPrefix = prefix;
+            authorOriginal = original;
+        }
     }
-    for (UILabel *v in labels) {
-        if (v != author && objc_getAssociatedObject(v, &kPriorAlpha))
-            privateAlpha(v, NO);
+    BOOL hideNames = enabled(kNames);
+    BOOL hideAvatars = enabled(kAvatars);
+    for (UIView *v in texts) {
+        if (!hideNames || v != author || inlineAuthor) privateAlpha(v, NO);
+        if (!hideNames || v != author || !inlineAuthor) cpRestoreInline(v);
     }
     for (UIView *v in images) {
-        if (v != avatar && objc_getAssociatedObject(v, &kPriorAlpha))
-            privateAlpha(v, NO);
+        if (v != avatar || !hideAvatars) privateAlpha(v, NO);
     }
-    if (author) privateAlpha(author, enabled(kNames));
-    if (avatar) privateAlpha(avatar, enabled(kAvatars));
+    if (hideNames && author) {
+        if (inlineAuthor) cpReplaceInline(author, authorOriginal, authorPrefix);
+        else privateAlpha(author, YES);
+    }
+    if (avatar) privateAlpha(avatar, hideAvatars);
 }
 static void walk(UIView *v, NSUInteger depth) {
     if (depth > 25) return;
@@ -265,6 +414,31 @@ static void setIdentifier(UIView *self, SEL cmd, NSString *value) {
     ((void (*)(id, SEL, id))originalSetIdentifier)(self, cmd, value);
     if (self.window) attach(self);
 }
+static void genericLayout(UIView *self, SEL cmd) {
+    ((void (*)(id, SEL))originalAnyLayout)(self, cmd);
+    if (!changingRenderedText && self.window && commentRow(self)) applyRow(self);
+}
+static void refreshFromLabel(UILabel *label) {
+    if (changingRenderedText || !enabled(kNames) || !label.window) return;
+    UIView *parent = label.superview;
+    for (NSUInteger depth = 0; parent && depth < 14; depth++, parent = parent.superview) {
+        if (!commentRow(parent)) continue;
+        __weak UIView *weakRow = parent;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIView *row = weakRow;
+            if (row.window) applyRow(row);
+        });
+        break;
+    }
+}
+static void labelText(UILabel *self, SEL cmd, NSString *value) {
+    ((void (*)(id, SEL, id))originalLabelText)(self, cmd, value);
+    refreshFromLabel(self);
+}
+static void labelAttributed(UILabel *self, SEL cmd, NSAttributedString *value) {
+    ((void (*)(id, SEL, id))originalLabelAttributed)(self, cmd, value);
+    refreshFromLabel(self);
+}
 static void tableLayout(UITableViewCell *self, SEL cmd) {
     ((void (*)(id, SEL))originalTableLayout)(self, cmd);
     if (commentRow(self)) applyRow(self);
@@ -294,6 +468,12 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             swapMethod([UIView class], @selector(didMoveToWindow),
                        (IMP)didMove, &originalMove);
+            swapMethod([UIView class], @selector(layoutSubviews),
+                       (IMP)genericLayout, &originalAnyLayout);
+            swapMethod([UILabel class], @selector(setText:),
+                       (IMP)labelText, &originalLabelText);
+            swapMethod([UILabel class], @selector(setAttributedText:),
+                       (IMP)labelAttributed, &originalLabelAttributed);
             swapMethod([UIView class], @selector(setAccessibilityLabel:),
                        (IMP)setLabel, &originalSetLabel);
             swapMethod([UIView class], @selector(setAccessibilityIdentifier:),
