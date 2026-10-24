@@ -79,6 +79,7 @@ static BOOL cpTextView(UIView *v) {
         ![cls containsString:@"styled"]) return NO;
     return [v respondsToSelector:@selector(attributedText)] ||
            [v respondsToSelector:NSSelectorFromString(@"attributedString")] ||
+           [v respondsToSelector:NSSelectorFromString(@"styledString")] ||
            [v respondsToSelector:@selector(text)];
 }
 static NSAttributedString *cpAttributed(UIView *v) {
@@ -88,6 +89,17 @@ static NSAttributedString *cpAttributed(UIView *v) {
         @try {
             id result = ((id (*)(id, SEL))objc_msgSend)(v, getter);
             if ([result isKindOfClass:[NSAttributedString class]]) return result;
+        } @catch (NSException *exception) {}
+    }
+    // IGCoreTextView is a UIView whose text is held by IGStyledString;
+    // it is not a UILabel and commonly has no attributedText property.
+    if ([v respondsToSelector:NSSelectorFromString(@"styledString")]) {
+        @try {
+            id styled = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"styledString"));
+            if ([styled respondsToSelector:NSSelectorFromString(@"attributedString")]) {
+                id value = ((id (*)(id, SEL))objc_msgSend)(styled, NSSelectorFromString(@"attributedString"));
+                if ([value isKindOfClass:[NSAttributedString class]]) return value;
+            }
         } @catch (NSException *exception) {}
     }
     return nil;
@@ -123,13 +135,38 @@ static BOOL cpSetAttributed(UIView *v, NSAttributedString *value) {
             changingRenderedText = NO;
         }
     }
+    // IGCoreTextView uses setStyledString:, which expects an IGStyledString
+    // wrapper rather than an NSAttributedString. Copy before editing to avoid
+    // mutating a shared/cached styled string belonging to other comments.
+    SEL getter = NSSelectorFromString(@"styledString");
+    SEL setter = NSSelectorFromString(@"setStyledString:");
+    SEL attrSetter = NSSelectorFromString(@"setAttributedString:");
+    if ([v respondsToSelector:getter] && [v respondsToSelector:setter]) {
+        @try {
+            id styled = ((id (*)(id, SEL))objc_msgSend)(v, getter);
+            if (styled && [styled conformsToProtocol:@protocol(NSCopying)]) {
+                id copied = [styled copy];
+                if ([copied respondsToSelector:attrSetter]) {
+                    changingRenderedText = YES;
+                    ((void (*)(id, SEL, id))objc_msgSend)(copied, attrSetter, [value mutableCopy]);
+                    ((void (*)(id, SEL, id))objc_msgSend)(v, setter, copied);
+                    changingRenderedText = NO;
+                    return YES;
+                }
+            }
+        } @catch (NSException *exception) {
+            changingRenderedText = NO;
+        }
+    }
     return NO;
 }
 static NSAttributedString *cpOriginalAttributed(UIView *v) {
     NSAttributedString *current = cpAttributed(v);
     NSAttributedString *stored = objc_getAssociatedObject(v, &kInlineOriginal);
     NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
-    if (stored && rendered && current && [current isEqualToAttributedString:rendered])
+    if (stored && rendered && current &&
+        ([current isEqualToAttributedString:rendered] ||
+         [current.string isEqualToString:rendered.string]))
         return stored;
     if (stored) {
         objc_setAssociatedObject(v, &kInlineOriginal, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -141,7 +178,10 @@ static void cpRestoreInline(UIView *v) {
     NSAttributedString *original = objc_getAssociatedObject(v, &kInlineOriginal);
     NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
     if (!original) return;
-    BOOL unchanged = rendered && [cpAttributed(v) isEqualToAttributedString:rendered];
+    NSAttributedString *current = cpAttributed(v);
+    BOOL unchanged = rendered && current &&
+        ([current isEqualToAttributedString:rendered] ||
+         [current.string isEqualToString:rendered.string]);
     objc_setAssociatedObject(v, &kInlineOriginal, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(v, &kInlineRendered, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (unchanged) cpSetAttributed(v, original);
@@ -152,7 +192,10 @@ static void cpReplaceInline(UIView *v, NSAttributedString *original, NSRange pre
     [masked deleteCharactersInRange:prefix];
     NSAttributedString *result = [masked copy];
     NSAttributedString *rendered = objc_getAssociatedObject(v, &kInlineRendered);
-    if (rendered && [cpAttributed(v) isEqualToAttributedString:result]) return;
+    NSAttributedString *current = cpAttributed(v);
+    if (rendered && current &&
+        ([current isEqualToAttributedString:result] ||
+         [current.string isEqualToString:result.string])) return;
     objc_setAssociatedObject(v, &kInlineOriginal, [original copy], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(v, &kInlineRendered, result, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (!cpSetAttributed(v, result)) cpRestoreInline(v);
