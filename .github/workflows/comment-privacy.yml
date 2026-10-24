@@ -1,0 +1,96 @@
+name: Build and inject Comment Privacy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ryukgram_ipa_url:
+        description: 'Direct HTTPS URL to your existing RyukGram IPA (blank = dylib only)'
+        required: false
+        default: ''
+        type: string
+  push:
+    paths:
+      - 'CommentPrivacy/**'
+      - '.github/workflows/comment-privacy.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile iOS arm64 dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p dist
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -fmodules -Os -Wall -Wextra \
+            -dynamiclib -Wl,-install_name,@rpath/CommentPrivacy.dylib \
+            -framework UIKit -framework Foundation \
+            CommentPrivacy/CommentPrivacy.m -o dist/CommentPrivacy.dylib
+          codesign --force --sign - dist/CommentPrivacy.dylib
+          file dist/CommentPrivacy.dylib
+          xcrun otool -L dist/CommentPrivacy.dylib
+
+      - name: Upload CommentPrivacy.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: CommentPrivacy-dylib
+          path: dist/CommentPrivacy.dylib
+          if-no-files-found: error
+
+      - name: Download existing RyukGram IPA
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
+        env:
+          SOURCE_URL: ${{ inputs.ryukgram_ipa_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$SOURCE_URL" in
+            https://*) ;;
+            *) echo '::error::A direct HTTPS download URL is required'; exit 1 ;;
+          esac
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
+            --output dist/RyukGram-original.ipa "$SOURCE_URL"
+          unzip -tq dist/RyukGram-original.ipa
+          unzip -Z1 dist/RyukGram-original.ipa | grep -Eq '^Payload/[^/]+\.app/Info\.plist$' || {
+            echo '::error::Downloaded file is not an IPA'; exit 1;
+          }
+
+      - name: Install injection utility
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            'https://github.com/asdfzxcvbn/ipapatch/releases/download/v2.1.3/ipapatch.macos-arm64' \
+            -o dist/ipapatch
+          chmod +x dist/ipapatch
+
+      - name: Inject additional dylib while retaining RyukGram
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
+        run: |
+          set -euo pipefail
+          dist/ipapatch \
+            --input dist/RyukGram-original.ipa \
+            --output dist/RyukGram-CommentPrivacy.ipa \
+            --dylib dist/CommentPrivacy.dylib \
+            --noconfirm
+          unzip -tq dist/RyukGram-CommentPrivacy.ipa
+          unzip -Z1 dist/RyukGram-CommentPrivacy.ipa | grep 'CommentPrivacy.dylib'
+          echo 'IPA patched; sign again in ESign/Feather before installation.'
+
+      - name: Upload patched IPA
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: RyukGram-CommentPrivacy-unsigned-IPA
+          path: dist/RyukGram-CommentPrivacy.ipa
+          if-no-files-found: error
