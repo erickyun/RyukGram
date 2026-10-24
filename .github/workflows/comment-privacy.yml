@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ryukgram_ipa_url:
-        description: 'Direct HTTPS URL to your existing RyukGram IPA (blank = dylib only)'
+        description: 'Direct HTTPS URL to RyukGram IPA, with or without the older CommentPrivacy tweak'
         required: false
         default: ''
         type: string
@@ -74,18 +74,33 @@ jobs:
             -o dist/ipapatch
           chmod +x dist/ipapatch
 
-      - name: Inject additional dylib while retaining RyukGram
+      - name: Inject or update Comment Privacy
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
         run: |
           set -euo pipefail
-          dist/ipapatch \
-            --input dist/RyukGram-original.ipa \
-            --output dist/RyukGram-CommentPrivacy.ipa \
-            --dylib dist/CommentPrivacy.dylib \
-            --noconfirm
-          unzip -tq dist/RyukGram-CommentPrivacy.ipa
-          unzip -Z1 dist/RyukGram-CommentPrivacy.ipa | grep 'CommentPrivacy.dylib'
-          echo 'IPA patched; sign again in ESign/Feather before installation.'
+          OUTPUT="$GITHUB_WORKSPACE/dist/RyukGram-CommentPrivacy.ipa"
+          INPUT="$GITHUB_WORKSPACE/dist/RyukGram-original.ipa"
+          if unzip -Z1 "$INPUT" | grep -Fq '/Frameworks/CommentPrivacy.dylib'; then
+            echo "Previous CommentPrivacy found. Replacing it."
+            STAGE="$(mktemp -d)"
+            unzip -q "$INPUT" -d "$STAGE"
+            APP="$(find "$STAGE/Payload" -mindepth 1 -maxdepth 1 -type d -name '*.app' | head -n1)"
+            test -n "$APP"
+            test -f "$APP/Frameworks/CommentPrivacy.dylib"
+            cp dist/CommentPrivacy.dylib "$APP/Frameworks/CommentPrivacy.dylib"
+            (cd "$STAGE" && zip -qry "$OUTPUT" .)
+            rm -rf "$STAGE"
+          else
+            echo "Injecting CommentPrivacy for the first time."
+            dist/ipapatch \
+              --input "$INPUT" \
+              --output "$OUTPUT" \
+              --dylib dist/CommentPrivacy.dylib \
+              --noconfirm
+          fi
+          unzip -tq "$OUTPUT"
+          unzip -Z1 "$OUTPUT" | grep -F 'CommentPrivacy.dylib'
+          echo 'Re-sign patched IPA in ESign/Feather before installation.'
 
       - name: Upload patched IPA
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.ryukgram_ipa_url != '' }}
