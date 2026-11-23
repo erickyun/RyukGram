@@ -318,11 +318,11 @@ jobs:
                   ipapatch --input "$ipa" --inplace --noconfirm \
                     --dylib packages/CommentPrivacy.dylib
                   unzip -tq "$ipa"
-                  unzip -Z1 "$ipa" | grep -Fq 'CommentPrivacy.dylib' || {
+                  unzip -Z1 "$ipa" | grep -F 'CommentPrivacy.dylib' >/dev/null || {
                     echo "::error::CommentPrivacy.dylib missing from $ipa"
                     exit 1
                   }
-                  unzip -Z1 "$ipa" | grep -Fq 'RyukGram.dylib' || {
+                  unzip -Z1 "$ipa" | grep -F 'RyukGram.dylib' >/dev/null || {
                     echo "::error::RyukGram.dylib missing from $ipa"
                     exit 1
                   }
