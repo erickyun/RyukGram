@@ -467,6 +467,20 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
     if (!nameView) {
         UIView *anchorPicture = pictureView;
         if (!anchorPicture) {
+            // IGImageView itself has no "profilepicture" in its class name.
+            // Recover the exact avatar through the nested native user button.
+            UIView *userButton = cpReelSubView(author, @"userButton");
+            if (!userButton) userButton = cpReelSubView(author, @"authorButton");
+            if (userButton) {
+                for (NSString *getter in @[@"profilePictureImageView",
+                                           @"profilePictureView", @"avatarImageView",
+                                           @"avatarView"]) {
+                    anchorPicture = cpReelSubView(userButton, getter);
+                    if (anchorPicture) break;
+                }
+            }
+        }
+        if (!anchorPicture) {
             for (UIView *candidate in pictures) {
                 CGRect r = [candidate convertRect:candidate.bounds toView:author];
                 CGFloat w = r.size.width, h = r.size.height;
