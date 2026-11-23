@@ -334,6 +334,13 @@ static void applyRow(UIView *row) {
 // *author* controls, never generic labels/images in posts, Explore or DMs.
 // Old Instagram exposes IGSundialViewerUserButton with userNameLabel and
 // profilePictureImageView; newer releases can use nested attribution wrappers.
+static BOOL cpReelOverlayRoot(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    return [n containsString:@"sundial"] &&
+           [n containsString:@"viewer"] &&
+           ([n containsString:@"videocontrolsoverlay"] ||
+            [n containsString:@"controlsoverlayview"]);
+}
 static BOOL cpReelAuthorRoot(UIView *v) {
     NSString *n = lower(NSStringFromClass(v.class));
     BOOL sundial = [n containsString:@"sundialviewer"] ||
@@ -391,8 +398,8 @@ static void cpGatherReel(UIView *v, NSMutableArray<UIView *> *texts,
         cpGatherReel(child, texts, pictures, depth + 1);
     }
 }
-static void cpApplyReelAuthor(UIView *author) {
-    if (!author.window || !cpReelAuthorRoot(author)) return;
+static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay) {
+    if (!author.window || (!confirmedByReelOverlay && !cpReelAuthorRoot(author))) return;
     NSString *cls = lower(NSStringFromClass(author.class));
     // A wrapper may expose a real user button; treat that button as the only
     // author target so sponsor, audio, follow, badges and reel captions survive.
@@ -401,8 +408,8 @@ static void cpApplyReelAuthor(UIView *author) {
         [cls containsString:@"authorattribution"]) {
         UIView *userButton = cpReelSubView(author, @"userButton");
         if (!userButton) userButton = cpReelSubView(author, @"authorButton");
-        if (userButton && userButton != author && cpReelAuthorRoot(userButton)) {
-            cpApplyReelAuthor(userButton);
+        if (userButton && userButton != author) {
+            cpApplyReelAuthorChecked(userButton, YES);
             return;
         }
     }
@@ -472,14 +479,29 @@ static void cpApplyReelAuthor(UIView *author) {
     if (nameView) privateAlpha(nameView, enabled(kReelNames));
     if (pictureView) privateAlpha(pictureView, enabled(kReelAvatars));
 }
+static void cpApplyReelAuthor(UIView *author) {
+    cpApplyReelAuthorChecked(author, NO);
+}
+static void cpApplyReelOverlay(UIView *overlay) {
+    if (!overlay.window || !cpReelOverlayRoot(overlay)) return;
+    // Modern overlays may expose a generic author UIView with a typed
+    // userAttributionView property; that selector is a reliable scope marker.
+    UIView *author = cpReelSubView(overlay, @"userAttributionView");
+    if (!author) author = cpReelSubView(overlay, @"authorAttributionView");
+    if (author) cpApplyReelAuthorChecked(author, YES);
+}
 static void cpRefreshReelFromText(UIView *text) {
     if (changingRenderedText || !enabled(kReelNames) || !text.window) return;
     for (UIView *parent = text.superview; parent; parent = parent.superview) {
-        if (cpReelAuthorRoot(parent)) {
+        BOOL specificAuthor = cpReelAuthorRoot(parent);
+        BOOL overlay = cpReelOverlayRoot(parent);
+        if (specificAuthor || overlay) {
             __weak UIView *weakAuthor = parent;
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIView *author = weakAuthor;
-                if (author.window) cpApplyReelAuthor(author);
+                if (!author.window) return;
+                if (specificAuthor) cpApplyReelAuthor(author);
+                if (overlay) cpApplyReelOverlay(author);
             });
             break;
         }
@@ -490,6 +512,7 @@ static void walk(UIView *v, NSUInteger depth) {
     if (depth > 25) return;
     if (commentRow(v)) applyRow(v);
     if (cpReelAuthorRoot(v)) cpApplyReelAuthor(v);
+    if (cpReelOverlayRoot(v)) cpApplyReelOverlay(v);
     for (UIView *c in v.subviews) walk(c, depth + 1);
 }
 static void refresh(void) {
@@ -617,13 +640,15 @@ static void didMove(UIView *self, SEL cmd) {
     attach(self);
     BOOL comments = commentRow(self);
     BOOL reelAuthor = cpReelAuthorRoot(self);
-    if (comments || reelAuthor) {
+    BOOL reelOverlay = cpReelOverlayRoot(self);
+    if (comments || reelAuthor || reelOverlay) {
         __weak UIView *weak = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             UIView *view = weak;
             if (!view.window) return;
             if (comments) applyRow(view);
             if (reelAuthor) cpApplyReelAuthor(view);
+            if (reelOverlay) cpApplyReelOverlay(view);
         });
     }
 }
@@ -640,6 +665,7 @@ static void genericLayout(UIView *self, SEL cmd) {
     if (changingRenderedText || !self.window) return;
     if (commentRow(self)) applyRow(self);
     if (cpReelAuthorRoot(self)) cpApplyReelAuthor(self);
+    if (cpReelOverlayRoot(self)) cpApplyReelOverlay(self);
 }
 static void refreshFromLabel(UILabel *label) {
     if (changingRenderedText || !label.window) return;
