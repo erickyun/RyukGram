@@ -36,6 +36,11 @@ on:
                 default: ""
                 required: false
                 type: string
+            include_comment_privacy:
+                description: "Inject Comment Privacy (comment + Reels author hiding)"
+                default: true
+                required: false
+                type: boolean
             release_tag:
                 description: "Release tag (blank = latest)"
                 default: ""
@@ -206,6 +211,21 @@ jobs:
 
                 ls -la packages
 
+            - name: Compile Comment Privacy add-on
+              if: ${{ inputs.include_comment_privacy }}
+              run: |
+                set -euo pipefail
+                SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+                xcrun --sdk iphoneos clang \
+                  -target arm64-apple-ios15.0 \
+                  -isysroot "$SDK" \
+                  -fobjc-arc -fmodules -Os -Wall -Wextra \
+                  -dynamiclib -Wl,-install_name,@rpath/CommentPrivacy.dylib \
+                  -framework UIKit -framework Foundation \
+                  CommentPrivacy/CommentPrivacy.m -o packages/CommentPrivacy.dylib
+                codesign --force --sign - packages/CommentPrivacy.dylib
+                xcrun otool -L packages/CommentPrivacy.dylib
+
             - name: Build sideloaded IPA (cyan + ipapatch with zxPluginsInject)
               if: ${{ inputs.build_sideload }}
               env:
@@ -282,6 +302,32 @@ jobs:
                 [ -n "$DUP_ID" ] && OUT="RyukGram_noplugins_v${VERSION}_IG${IG_VER}-dup.ipa"
                 mv packages/RyukGram-noplugins.ipa "packages/${OUT}"
                 ls -la packages
+
+            - name: Add Comment Privacy to RyukGram IPA(s)
+              if: ${{ inputs.include_comment_privacy }}
+              run: |
+                set -euo pipefail
+                shopt -s nullglob
+                OUTPUTS=(packages/RyukGram_sideload_v*.ipa packages/RyukGram_noplugins_v*.ipa)
+                if [ "${#OUTPUTS[@]}" -eq 0 ]; then
+                  echo "::error::No RyukGram IPA was produced"
+                  exit 1
+                fi
+                for ipa in "${OUTPUTS[@]}"; do
+                  echo "Injecting CommentPrivacy.dylib into $ipa"
+                  ipapatch --input "$ipa" --inplace --noconfirm \
+                    --dylib packages/CommentPrivacy.dylib
+                  unzip -tq "$ipa"
+                  unzip -Z1 "$ipa" | grep -F 'CommentPrivacy.dylib' >/dev/null || {
+                    echo "::error::CommentPrivacy.dylib missing from $ipa"
+                    exit 1
+                  }
+                  unzip -Z1 "$ipa" | grep -F 'RyukGram.dylib' >/dev/null || {
+                    echo "::error::RyukGram.dylib missing from $ipa"
+                    exit 1
+                  }
+                done
+                echo "Done: RyukGram + CommentPrivacy in every selected IPA."
 
             - name: Upload sideload IPA artifact
               if: ${{ inputs.upload_artifact && inputs.build_sideload }}

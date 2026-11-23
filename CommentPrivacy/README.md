@@ -1,3 +1,35 @@
+## RyukGram v1.6.0 + Reels author privacy
+
+Four independent switches are now available in the **same Comment Privacy menu**.
+Long-press the Instagram **Comments** button to open the sheet:
+
+| Comments section | Reels section |
+| --- | --- |
+| Hide Comment Usernames | Hide Reels Usernames |
+| Hide Comment Avatars | Hide Reels Profile Pictures |
+
+- The original two comment switches and their stored preference keys are unchanged.
+- The Reels switches affect only recognised **Reels video author** UI, not users in comments, ordinary feed posts, profiles, stories or DMs.
+- Reels targeting uses known Instagram native IGSundialViewerUserButton accessors (userNameLabel and profilePictureImageView) and IGSundialViewerUserAttributionView / video-overlay accessors, with conservative fallback matching. It does not hide the whole author panel, caption, music, or interaction buttons.
+- All four switches default OFF for new installations; previous comment preferences are preserved if the app container is retained.
+
+### Build RyukGram v1.6.0 and Comment Privacy in a single IPA
+
+1. Open **Actions → Build sideloaded IPA from Release Assets** in this fork.
+2. Provide a decrypted Instagram **456.0.0** IPA as a direct URL in the decrypted_instagram_url input. Use an unmodified Instagram IPA, **not an already RyukGram-injected IPA**.
+3. Enter **v1.6.0** in the release_tag input (or leave empty if that is still the latest upstream release).
+4. Leave **include_comment_privacy** ON (default); choose sideload or no-plugins build as usual.
+5. Download the resulting IPA artifact, sign in ESign/Feather, and install.
+
+That workflow downloads the official upstream RyukGram v1.6.0 release binaries while compiling the custom CommentPrivacy dylib from this fork. RyukGram and the Privacy add-on are injected separately; neither replaces the other. The default IPA flow does not require a second manual injection.
+
+### Upgrade an already patched IPA
+
+The separate **Build and inject Comment Privacy** workflow can replace the previous privacy dylib inside a patched IPA, but this **does not upgrade RyukGram itself**. To get upstream RyukGram v1.6.0, use the clean-Instagram-IPA build route above. Preserve your signing identity and original application bundle identifier to maintain the iOS app container where possible, and back up critical data before reinstalling.
+
+**Compatibility warning:** Objective-C/Swift view class names change between Instagram versions. The v1.6.0/Instagram 456 native Reels privacy functionality is compile-tested, not confirmed on a physical device. A missing author component is left visible rather than masking unrelated content.
+
+
 # Comment Privacy (experimental)
 
 A separate iOS Objective-C dynamic library for the RyukGram-patched Instagram IPA. It does **not** replace RyukGram's own dylib, bundle, or settings.
@@ -5,8 +37,8 @@ A separate iOS Objective-C dynamic library for the RyukGram-patched Instagram IP
 ## What it is designed to do
 
 - Long-press a **Comment** button for 0.55 seconds to open **Comment Privacy**.
-- Toggle **Hide Comment Usernames** and **Hide Comment Avatars** independently.
-- Both switches default to OFF and persist in local app preferences.
+- Toggle two comment switches and two Reels author switches independently.
+- All four switches default to OFF and persist in local app preferences.
 - Hide only detected comment author labels and avatar views; retain comments, likes, dates and replies.
 - Restore the view's original alpha when the corresponding setting is disabled.
 

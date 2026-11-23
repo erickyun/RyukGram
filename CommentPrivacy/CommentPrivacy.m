@@ -6,6 +6,8 @@
 // Independent experimental Instagram tweak. RyukGram itself is not modified.
 static NSString *const kNames = @"CPHideCommentUsernames";
 static NSString *const kAvatars = @"CPHideCommentAvatars";
+static NSString *const kReelNames = @"CPHideReelUsernames";
+static NSString *const kReelAvatars = @"CPHideReelProfilePictures";
 static char kGesture, kPriorAlpha, kInlineOriginal, kInlineRendered;
 static IMP originalMove, originalTableLayout, originalCollectionLayout, originalAnyLayout;
 static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
@@ -327,9 +329,191 @@ static void applyRow(UIView *row) {
     }
     if (avatar) privateAlpha(avatar, hideAvatars);
 }
+
+// Reels author controls. Restrict modifications to native Sundial viewer
+// *author* controls, never generic labels/images in posts, Explore or DMs.
+// Old Instagram exposes IGSundialViewerUserButton with userNameLabel and
+// profilePictureImageView; newer releases can use nested attribution wrappers.
+static BOOL cpReelOverlayRoot(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    return [n containsString:@"sundial"] &&
+           [n containsString:@"viewer"] &&
+           ([n containsString:@"videocontrolsoverlay"] ||
+            [n containsString:@"controlsoverlayview"]);
+}
+static BOOL cpReelAuthorRoot(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    BOOL sundial = [n containsString:@"sundialviewer"] ||
+                   ([n containsString:@"sundial"] && [n containsString:@"reel"]);
+    if (!sundial) return NO;
+    return [n containsString:@"userbutton"] ||
+           [n containsString:@"userattribution"] ||
+           [n containsString:@"creatorattribution"] ||
+           [n containsString:@"authorattribution"] ||
+           [n containsString:@"creatorheader"];
+}
+static id cpSafeGetter(id object, NSString *property) {
+    if (!object || !property.length) return nil;
+    SEL getter = NSSelectorFromString(property);
+    if (![object respondsToSelector:getter]) return nil;
+    @try { return ((id (*)(id, SEL))objc_msgSend)(object, getter); }
+    @catch (NSException *exception) { return nil; }
+}
+static UIView *cpReelSubView(id parent, NSString *property) {
+    id candidate = cpSafeGetter(parent, property);
+    if (![candidate isKindOfClass:[UIView class]]) return nil;
+    UIView *view = parent;
+    if (![view isKindOfClass:[UIView class]] || ![(UIView *)candidate isDescendantOfView:view])
+        return nil;
+    return candidate;
+}
+static NSString *cpReelModelName(id author) {
+    id usernameValue = cpSafeGetter(author, @"userName");
+    if (![usernameValue isKindOfClass:[NSString class]]) {
+        id user = cpSafeGetter(author, @"user");
+        usernameValue = cpSafeGetter(user, @"username");
+    }
+    NSString *name = [usernameValue isKindOfClass:[NSString class]]
+                     ? (NSString *)usernameValue : nil;
+    if ([name hasPrefix:@"@"]) name = [name substringFromIndex:1];
+    return username(name) ? name : nil;
+}
+static BOOL cpReelNameMatches(UIView *view, NSString *modelName) {
+    NSString *text = [cpString(view) stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!text.length || !username(text)) return NO;
+    if ([text hasPrefix:@"@"]) text = [text substringFromIndex:1];
+    return modelName.length && [text isEqualToString:modelName];
+}
+static void cpGatherReel(UIView *v, NSMutableArray<UIView *> *texts,
+                         NSMutableArray<UIView *> *pictures, NSUInteger depth) {
+    if (depth > 8) return;
+    for (UIView *child in v.subviews) {
+        NSString *cls = lower(NSStringFromClass(child.class));
+        if (cpTextView(child)) [texts addObject:child];
+        BOOL avatar = [cls containsString:@"profilepicture"] ||
+                      [cls containsString:@"profilepic"] ||
+                      [cls containsString:@"avatar"];
+        if (avatar) [pictures addObject:child];
+        cpGatherReel(child, texts, pictures, depth + 1);
+    }
+}
+static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay) {
+    if (!author.window || (!confirmedByReelOverlay && !cpReelAuthorRoot(author))) return;
+    NSString *cls = lower(NSStringFromClass(author.class));
+    // A wrapper may expose a real user button; treat that button as the only
+    // author target so sponsor, audio, follow, badges and reel captions survive.
+    if ([cls containsString:@"userattribution"] ||
+        [cls containsString:@"creatorattribution"] ||
+        [cls containsString:@"authorattribution"] ||
+        (confirmedByReelOverlay && cpReelSubView(author, @"userButton"))) {
+        UIView *userButton = cpReelSubView(author, @"userButton");
+        if (!userButton) userButton = cpReelSubView(author, @"authorButton");
+        if (userButton && userButton != author) {
+            cpApplyReelAuthorChecked(userButton, YES);
+            return;
+        }
+    }
+    UIView *nameView = nil;
+    for (NSString *getter in @[@"userNameLabel", @"usernameLabel",
+                               @"userNameView", @"usernameView",
+                               @"authorNameLabel"]) {
+        nameView = cpReelSubView(author, getter);
+        if (nameView) break;
+    }
+    UIView *pictureView = nil;
+    for (NSString *getter in @[@"profilePictureImageView", @"profilePictureView",
+                               @"profilePicView", @"avatarImageView",
+                               @"avatarView"]) {
+        pictureView = cpReelSubView(author, getter);
+        if (pictureView) break;
+    }
+    // Class-name fallback for newer Swift/Objective-C attribution variants.
+    NSMutableArray<UIView *> *texts = [NSMutableArray array];
+    NSMutableArray<UIView *> *pictures = [NSMutableArray array];
+    cpGatherReel(author, texts, pictures, 0);
+    NSString *modelName = cpReelModelName(author);
+    if (!nameView && modelName) {
+        for (UIView *view in texts) {
+            if (cpReelNameMatches(view, modelName)) { nameView = view; break; }
+        }
+    }
+    if (!nameView) {
+        for (UIView *view in texts) {
+            NSString *name = lower(NSStringFromClass(view.class));
+            NSString *identifier = lower(view.accessibilityIdentifier);
+            if (([name containsString:@"username"] ||
+                 [name containsString:@"authorname"] ||
+                 [identifier containsString:@"username"]) &&
+                 username(cpString(view))) {
+                nameView = view;
+                break;
+            }
+        }
+    }
+    // Only use a generic IGImageView as a fallback in a known user button,
+    // not in the much broader reel overlay (which also holds music artwork).
+    if (!pictureView && [cls containsString:@"userbutton"]) {
+        for (UIView *view in author.subviews) {
+            NSString *type = lower(NSStringFromClass(view.class));
+            CGSize size = view.bounds.size;
+            if (([type containsString:@"igimageview"] ||
+                 [type containsString:@"profilepicture"] ||
+                 [type containsString:@"avatar"]) &&
+                size.width >= 16 && size.height >= 16 &&
+                size.width <= 96 && size.height <= 96) {
+                pictureView = view;
+                break;
+            }
+        }
+    }
+    if (!pictureView) {
+        for (UIView *view in pictures) {
+            CGSize size = view.bounds.size;
+            if (size.width >= 16 && size.height >= 16 &&
+                size.width <= 96 && size.height <= 96) {
+                pictureView = view;
+                break;
+            }
+        }
+    }
+    if (nameView) privateAlpha(nameView, enabled(kReelNames));
+    if (pictureView) privateAlpha(pictureView, enabled(kReelAvatars));
+}
+static void cpApplyReelAuthor(UIView *author) {
+    cpApplyReelAuthorChecked(author, NO);
+}
+static void cpApplyReelOverlay(UIView *overlay) {
+    if (!overlay.window || !cpReelOverlayRoot(overlay)) return;
+    // Modern overlays may expose a generic author UIView with a typed
+    // userAttributionView property; that selector is a reliable scope marker.
+    UIView *author = cpReelSubView(overlay, @"userAttributionView");
+    if (!author) author = cpReelSubView(overlay, @"authorAttributionView");
+    if (author) cpApplyReelAuthorChecked(author, YES);
+}
+static void cpRefreshReelFromText(UIView *text) {
+    if (changingRenderedText || !enabled(kReelNames) || !text.window) return;
+    for (UIView *parent = text.superview; parent; parent = parent.superview) {
+        BOOL specificAuthor = cpReelAuthorRoot(parent);
+        BOOL overlay = cpReelOverlayRoot(parent);
+        if (specificAuthor || overlay) {
+            __weak UIView *weakAuthor = parent;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIView *author = weakAuthor;
+                if (!author.window) return;
+                if (specificAuthor) cpApplyReelAuthor(author);
+                if (overlay) cpApplyReelOverlay(author);
+            });
+            break;
+        }
+    }
+}
+
 static void walk(UIView *v, NSUInteger depth) {
     if (depth > 25) return;
     if (commentRow(v)) applyRow(v);
+    if (cpReelAuthorRoot(v)) cpApplyReelAuthor(v);
+    if (cpReelOverlayRoot(v)) cpApplyReelOverlay(v);
     for (UIView *c in v.subviews) walk(c, depth + 1);
 }
 static void refresh(void) {
@@ -350,28 +534,42 @@ static void refresh(void) {
         target:self action:@selector(closeMenu)];
     self.tableView.rowHeight = 61;
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, 270, 70)];
-    footer.text = @"Only detected post and Reels comment rows. Other screens are unchanged.";
+    footer.text = @"Comment options affect post and Reels comments. Reels options affect the video author's username and profile picture only.";
     footer.textColor = [UIColor secondaryLabelColor];
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textAlignment = NSTextAlignmentCenter;
     footer.numberOfLines = 0;
     self.tableView.tableFooterView = footer;
 }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 2;
+}
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return 2;
+}
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return section == 0 ? @"Comments" : @"Reels";
 }
 - (UITableViewCell *)tableView:(UITableView *)tableView
         cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"privacy"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
                                           reuseIdentifier:@"privacy"];
-    BOOL isName = indexPath.row == 0;
-    cell.textLabel.text = isName ? @"Hide Comment Usernames" : @"Hide Comment Avatars";
+    NSString *key = nil;
+    NSString *title = nil;
+    if (indexPath.section == 0) {
+        key = indexPath.row == 0 ? kNames : kAvatars;
+        title = indexPath.row == 0 ? @"Hide Comment Usernames" : @"Hide Comment Avatars";
+    } else {
+        key = indexPath.row == 0 ? kReelNames : kReelAvatars;
+        title = indexPath.row == 0 ? @"Hide Reels Usernames" : @"Hide Reels Profile Pictures";
+    }
+    cell.textLabel.text = title;
     cell.textLabel.adjustsFontSizeToFitWidth = YES;
     cell.textLabel.minimumScaleFactor = 0.8;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [[UISwitch alloc] init];
-    sw.accessibilityIdentifier = isName ? kNames : kAvatars;
+    sw.accessibilityIdentifier = key;
     sw.on = enabled(sw.accessibilityIdentifier);
     [sw addTarget:self action:@selector(changed:) forControlEvents:UIControlEventValueChanged];
     cell.accessoryView = sw;
@@ -441,11 +639,17 @@ static void didMove(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalMove)(self, cmd);
     if (!self.window) return;
     attach(self);
-    if (commentRow(self)) {
+    BOOL comments = commentRow(self);
+    BOOL reelAuthor = cpReelAuthorRoot(self);
+    BOOL reelOverlay = cpReelOverlayRoot(self);
+    if (comments || reelAuthor || reelOverlay) {
         __weak UIView *weak = self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIView *row = weak;
-            if (row.window) applyRow(row);
+            UIView *view = weak;
+            if (!view.window) return;
+            if (comments) applyRow(view);
+            if (reelAuthor) cpApplyReelAuthor(view);
+            if (reelOverlay) cpApplyReelOverlay(view);
         });
     }
 }
@@ -459,10 +663,15 @@ static void setIdentifier(UIView *self, SEL cmd, NSString *value) {
 }
 static void genericLayout(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalAnyLayout)(self, cmd);
-    if (!changingRenderedText && self.window && commentRow(self)) applyRow(self);
+    if (changingRenderedText || !self.window) return;
+    if (commentRow(self)) applyRow(self);
+    if (cpReelAuthorRoot(self)) cpApplyReelAuthor(self);
+    if (cpReelOverlayRoot(self)) cpApplyReelOverlay(self);
 }
 static void refreshFromLabel(UILabel *label) {
-    if (changingRenderedText || !enabled(kNames) || !label.window) return;
+    if (changingRenderedText || !label.window) return;
+    cpRefreshReelFromText(label);
+    if (!enabled(kNames)) return;
     UIView *parent = label.superview;
     for (NSUInteger depth = 0; parent && depth < 14; depth++, parent = parent.superview) {
         if (!commentRow(parent)) continue;
@@ -525,7 +734,7 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)tableLayout, &originalTableLayout);
             swapMethod([UICollectionViewCell class], @selector(layoutSubviews),
                        (IMP)collectionLayout, &originalCollectionLayout);
-            NSLog(@"[CommentPrivacy] loaded; both toggles default OFF");
+            NSLog(@"[CommentPrivacy] loaded; four independent toggles default OFF");
         });
     }
 }
