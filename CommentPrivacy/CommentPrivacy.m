@@ -401,8 +401,9 @@ static void cpGatherReel(UIView *v, NSMutableArray<UIView *> *texts,
 static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay) {
     if (!author.window || (!confirmedByReelOverlay && !cpReelAuthorRoot(author))) return;
     NSString *cls = lower(NSStringFromClass(author.class));
-    // A wrapper may expose a real user button; treat that button as the only
-    // author target so sponsor, audio, follow, badges and reel captions survive.
+    // Modern Instagram may render the avatar inside a user button but keep
+    // the visible username as a SIBLING under the attribution wrapper.
+    // Process the nested button AND the wrapper, instead of returning early.
     if ([cls containsString:@"userattribution"] ||
         [cls containsString:@"creatorattribution"] ||
         [cls containsString:@"authorattribution"] ||
@@ -411,15 +412,21 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
         if (!userButton) userButton = cpReelSubView(author, @"authorButton");
         if (userButton && userButton != author) {
             cpApplyReelAuthorChecked(userButton, YES);
-            return;
+            // Do not return: a sibling username text view can live in author.
         }
     }
     UIView *nameView = nil;
     for (NSString *getter in @[@"userNameLabel", @"usernameLabel",
                                @"userNameView", @"usernameView",
-                               @"authorNameLabel"]) {
-        nameView = cpReelSubView(author, getter);
-        if (nameView) break;
+                               @"userNameTextView", @"usernameTextView",
+                               @"authorNameLabel", @"authorLabel",
+                               @"nameLabel", @"nameTextView",
+                               @"authorTextView"]) {
+        UIView *candidate = cpReelSubView(author, getter);
+        if (candidate && username(cpString(candidate))) {
+            nameView = candidate;
+            break;
+        }
     }
     UIView *pictureView = nil;
     for (NSString *getter in @[@"profilePictureImageView", @"profilePictureView",
@@ -448,6 +455,62 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
                  username(cpString(view))) {
                 nameView = view;
                 break;
+            }
+        }
+    }
+    // Fallback: in the Reels attribution area, the separate author label
+    // is normally positioned immediately to the RIGHT of the avatar.
+    // Older Instagram used userNameLabel; newer builds often use a generic
+    // UILabel/IGCoreTextView, whose class/identifier does not say "username".
+    // Select it by geometry *within this author-only subtree*. This avoids
+    // touching Follow, captions, music labels, like counts or timestamps.
+    if (!nameView) {
+        UIView *anchorPicture = pictureView;
+        if (!anchorPicture) {
+            // IGImageView itself has no "profilepicture" in its class name.
+            // Recover the exact avatar through the nested native user button.
+            UIView *userButton = cpReelSubView(author, @"userButton");
+            if (!userButton) userButton = cpReelSubView(author, @"authorButton");
+            if (userButton) {
+                for (NSString *getter in @[@"profilePictureImageView",
+                                           @"profilePictureView", @"avatarImageView",
+                                           @"avatarView"]) {
+                    anchorPicture = cpReelSubView(userButton, getter);
+                    if (anchorPicture) break;
+                }
+            }
+        }
+        if (!anchorPicture) {
+            for (UIView *candidate in pictures) {
+                CGRect r = [candidate convertRect:candidate.bounds toView:author];
+                CGFloat w = r.size.width, h = r.size.height;
+                if (w >= 16 && w <= 96 && h >= 16 && h <= 96) {
+                    anchorPicture = candidate;
+                    break;
+                }
+            }
+        }
+        if (anchorPicture) {
+            CGRect av = [anchorPicture convertRect:anchorPicture.bounds toView:author];
+            CGFloat best = CGFLOAT_MAX;
+            NSString *knownName = cpReelModelName(author);
+            for (UIView *candidate in texts) {
+                NSString *value = [cpString(candidate) stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (!username(value)) continue; // Follow / See more excluded
+                CGRect r = [candidate convertRect:candidate.bounds toView:author];
+                if (r.size.width < 18 || r.size.width > 350 ||
+                    r.size.height < 9 || r.size.height > 65) continue;
+                CGFloat dx = CGRectGetMinX(r) - CGRectGetMaxX(av);
+                CGFloat dy = fabs(CGRectGetMidY(r) - CGRectGetMidY(av));
+                if (dx < -12 || dx > 210 || dy > 65) continue;
+                CGFloat score = dy + 0.25 * fabs(dx - 12);
+                if (knownName && cpReelNameMatches(candidate, knownName))
+                    score -= 100;
+                if (score < best) {
+                    best = score;
+                    nameView = candidate;
+                }
             }
         }
     }
@@ -485,10 +548,12 @@ static void cpApplyReelAuthor(UIView *author) {
 }
 static void cpApplyReelOverlay(UIView *overlay) {
     if (!overlay.window || !cpReelOverlayRoot(overlay)) return;
-    // Modern overlays may expose a generic author UIView with a typed
-    // userAttributionView property; that selector is a reliable scope marker.
+    // Modern overlays may expose a generic attribution UIView with a typed
+    // userAttributionView property, but the avatar/username can be siblings
+    // rather than both children of a historic IGSundialViewerUserButton.
     UIView *author = cpReelSubView(overlay, @"userAttributionView");
     if (!author) author = cpReelSubView(overlay, @"authorAttributionView");
+    if (!author) author = cpReelSubView(overlay, @"creatorAttributionView");
     if (author) cpApplyReelAuthorChecked(author, YES);
 }
 static void cpRefreshReelFromText(UIView *text) {
