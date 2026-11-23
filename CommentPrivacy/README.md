@@ -37,8 +37,8 @@ A separate iOS Objective-C dynamic library for the RyukGram-patched Instagram IP
 ## What it is designed to do
 
 - Long-press a **Comment** button for 0.55 seconds to open **Comment Privacy**.
-- Toggle **Hide Comment Usernames** and **Hide Comment Avatars** independently.
-- Both switches default to OFF and persist in local app preferences.
+- Toggle two comment switches and two Reels author switches independently.
+- All four switches default to OFF and persist in local app preferences.
 - Hide only detected comment author labels and avatar views; retain comments, likes, dates and replies.
 - Restore the view's original alpha when the corresponding setting is disabled.
 
