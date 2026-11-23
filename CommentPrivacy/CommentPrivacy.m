@@ -405,7 +405,8 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
     // author target so sponsor, audio, follow, badges and reel captions survive.
     if ([cls containsString:@"userattribution"] ||
         [cls containsString:@"creatorattribution"] ||
-        [cls containsString:@"authorattribution"]) {
+        [cls containsString:@"authorattribution"] ||
+        (confirmedByReelOverlay && cpReelSubView(author, @"userButton"))) {
         UIView *userButton = cpReelSubView(author, @"userButton");
         if (!userButton) userButton = cpReelSubView(author, @"authorButton");
         if (userButton && userButton != author) {
