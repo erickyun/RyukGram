@@ -416,8 +416,14 @@ static BOOL cpReelCombinedNames(NSString *value) {
     dispatch_once(&once, ^{
         NSString *name = @"@?[A-Za-z0-9._]{1,30}";
         NSString *separator = @"(?:\\s+(?:and|ve|und|et|y|e|en)\\s+|\\s*[,&·+]\\s*)";
+        // Instagram abbreviates three or more creators as "alice and 2
+        // others". The count phrase is NOT an Instagram username.
+        NSString *count = @"(?:[0-9]+\\s+(?:others?|other\\s+people|kişi|diğer\\s+kişi|weitere|autres|más|otros?|outras?|outros?|anderen))";
+        NSString *countSeparator = @"(?:\\s+(?:and|ve|und|et|y|e|en)\\s+|\\s*[&+]\\s*)";
         NSString *pattern = [NSString stringWithFormat:
-            @"^\\s*%@(?:%@%@)+\\s*$", name, separator, name];
+            @"^\\s*%@(?:%@%@)*%@%@\\s*$|^\\s*%@(?:%@%@)+\\s*$",
+            name, separator, name, countSeparator, count,
+            name, separator, name];
         re = [NSRegularExpression regularExpressionWithPattern:pattern
                     options:NSRegularExpressionCaseInsensitive error:NULL];
     });
@@ -429,6 +435,19 @@ static BOOL cpReelCombinedNames(NSString *value) {
                              @"original audio", @"paid partnership"])
         if ([l isEqualToString:bad]) return NO;
     return YES;
+}
+// A count can also be a separate text view next to the first author's
+// label. Only use this matcher on the already-confirmed author line.
+static BOOL cpReelCountSuffix(NSString *value) {
+    if (!value.length || value.length > 64) return NO;
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:
+            @"^\\s*(?:(?:and|ve|und|et|y|e|en|&|\\+)\\s*)?[0-9]+\\s+(?:others?|other\\s+people|kişi|diğer\\s+kişi|weitere|autres|más|otros?|outras?|outros?|anderen)\\s*$"
+            options:NSRegularExpressionCaseInsensitive error:NULL];
+    });
+    return [re numberOfMatchesInString:value options:0 range:NSMakeRange(0,value.length)] > 0;
 }
 static BOOL cpReelAuthorText(NSString *s) {
     return username(s) || cpReelCombinedNames(s);
@@ -538,6 +557,22 @@ static void cpApplyReelCollaborators(UIView *author, NSArray<UIView *> *texts,
     NSString *rootName = lower(NSStringFromClass(author.class));
     BOOL collab = combined != nil || [rootName containsString:@"collab"] ||
                   [rootName containsString:@"coauthor"];
+    // Recognize a split "and 2 others" label only when it is on the
+    // same horizontal author row as the already identified username.
+    if (!collab && primaryName) {
+        CGRect line = [primaryName convertRect:primaryName.bounds toView:author];
+        for (UIView *text in texts) {
+            if (!cpReelCountSuffix(cpString(text))) continue;
+            CGRect r = [text convertRect:text.bounds toView:author];
+            CGFloat dx = CGRectGetMinX(r) - CGRectGetMaxX(line);
+            CGFloat dy = fabs(CGRectGetMidY(r)-CGRectGetMidY(line));
+            if (r.size.height >= 8 && r.size.height <= 58 &&
+                dx >= -10 && dx <= 80 && dy <= MAX(8.0,line.size.height*0.6)) {
+                collab = YES;
+                break;
+            }
+        }
+    }
     // Identify distinct, overlapping/adjacent portrait siblings (not the
     // nested image and its own wrapper) as evidence of a Collab layout.
     for (UIView *a in portraits) {
@@ -581,7 +616,7 @@ static void cpApplyReelCollaborators(UIView *author, NSArray<UIView *> *texts,
         if (line) {
             for (UIView *text in texts) {
                 NSString *value = cpString(text);
-                if (!cpReelAuthorText(value)) continue;
+                if (!cpReelAuthorText(value) && !cpReelCountSuffix(value)) continue;
                 CGRect r = [text convertRect:text.bounds toView:author];
                 if (r.size.height < 8 || r.size.height > 58) continue;
                 CGFloat dy = fabs(CGRectGetMidY(r)-CGRectGetMidY(lineRect));
