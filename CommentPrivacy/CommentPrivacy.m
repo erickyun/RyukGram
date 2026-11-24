@@ -411,13 +411,16 @@ static BOOL cpReelCombinedNames(NSString *value) {
                               @"\u200E", @"\u200F", @"\u202A", @"\u202C"])
         [clean replaceOccurrencesOfString:mark withString:@"" options:0
                                     range:NSMakeRange(0, clean.length)];
-    NSString *name = @"@?[A-Za-z0-9._]{1,30}";
-    NSString *separator = @"(?:\\s+(?:and|ve|und|et|y|e|en)\\s+|\\s*[,&·+]\\s*)";
-    NSString *pattern = [NSString stringWithFormat:
-        @"^\\s*%@(?:%@%@)+\\s*$", name,
-        separator, name];
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern
-                                     options:NSRegularExpressionCaseInsensitive error:NULL];
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *name = @"@?[A-Za-z0-9._]{1,30}";
+        NSString *separator = @"(?:\\s+(?:and|ve|und|et|y|e|en)\\s+|\\s*[,&·+]\\s*)";
+        NSString *pattern = [NSString stringWithFormat:
+            @"^\\s*%@(?:%@%@)+\\s*$", name, separator, name];
+        re = [NSRegularExpression regularExpressionWithPattern:pattern
+                    options:NSRegularExpressionCaseInsensitive error:NULL];
+    });
     if ([re numberOfMatchesInString:clean options:0
                               range:NSMakeRange(0,clean.length)] == 0) return NO;
     // The pattern is for author handles, not metadata or controls.
@@ -477,8 +480,34 @@ static BOOL cpCollabNearPortrait(CGRect label, CGRect avatar) {
            label.size.height <= 58 && dx >= -15 && dx <= 180 &&
            dy <= MAX(22.0, avatar.size.height * 0.8);
 }
+// Weak tracking permits restoring even when Instagram has rebound a cell
+// and no longer exposes the same Collab layout.
+static NSHashTable<UIView *> *cpCollabNames;
+static NSHashTable<UIView *> *cpCollabPictures;
+static void cpCollabAlpha(UIView *view, BOOL hide, BOOL isName) {
+    NSHashTable<UIView *> *views = isName ? cpCollabNames : cpCollabPictures;
+    if (!views && hide) {
+        views = [NSHashTable weakObjectsHashTable];
+        if (isName) cpCollabNames = views;
+        else cpCollabPictures = views;
+    }
+    if (hide) [views addObject:view];
+    else [views removeObject:view];
+    privateAlpha(view, hide);
+}
+static void cpRestoreDisabledCollab(void) {
+    if (!enabled(kReelNames)) {
+        for (UIView *v in cpCollabNames.allObjects) privateAlpha(v, NO);
+        [cpCollabNames removeAllObjects];
+    }
+    if (!enabled(kReelAvatars)) {
+        for (UIView *v in cpCollabPictures.allObjects) privateAlpha(v, NO);
+        [cpCollabPictures removeAllObjects];
+    }
+}
 static void cpApplyReelCollaborators(UIView *author, NSArray<UIView *> *texts,
                                      UIView *primaryName, UIView *primaryPicture) {
+    if (!enabled(kReelNames) && !enabled(kReelAvatars)) return;
     NSMutableOrderedSet<UIView *> *portraits = [NSMutableOrderedSet orderedSet];
     NSMutableOrderedSet<UIView *> *generic = [NSMutableOrderedSet orderedSet];
     if (primaryPicture && cpSmallReelPortrait(primaryPicture, author, NULL))
@@ -568,12 +597,23 @@ static void cpApplyReelCollaborators(UIView *author, NSArray<UIView *> *texts,
         }
     }
 
-    for (UIView *name in names) privateAlpha(name, enabled(kReelNames));
-    // Preserve the original single-avatar behavior on non-Collab reels.
     if (collab) {
+        for (UIView *name in names) cpCollabAlpha(name, enabled(kReelNames), YES);
+        UIView *line = combined ?: primaryName;
+        CGRect lr = line ? [line convertRect:line.bounds toView:author] : CGRectNull;
+        CGRect anchor = primaryPicture ?
+            [primaryPicture convertRect:primaryPicture.bounds toView:author] : CGRectNull;
         for (UIView *picture in portraits) {
-            // Keep the whole portrait stack hidden, not just the front image.
-            privateAlpha(picture, enabled(kReelAvatars));
+            CGRect pr = [picture convertRect:picture.bounds toView:author];
+            BOOL nearLine = line && cpCollabNearPortrait(lr, pr) &&
+                            CGRectGetMidX(pr) < CGRectGetMinX(lr) &&
+                            CGRectGetMinX(lr)-CGRectGetMaxX(pr) <= 80;
+            BOOL nearPrimary = primaryPicture &&
+                fabs(CGRectGetMidX(pr)-CGRectGetMidX(anchor)) <= MAX(pr.size.width,anchor.size.width)*1.6 &&
+                fabs(CGRectGetMidY(pr)-CGRectGetMidY(anchor)) <= MAX(pr.size.height,anchor.size.height);
+            // Keep the whole avatar stack hidden, not unrelated artwork.
+            if (picture == primaryPicture || nearLine || nearPrimary)
+                cpCollabAlpha(picture, enabled(kReelAvatars), NO);
         }
     }
 }
@@ -764,6 +804,7 @@ static void walk(UIView *v, NSUInteger depth) {
 }
 static void refresh(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        cpRestoreDisabledCollab();
         for (UIWindow *w in [UIApplication sharedApplication].windows) walk(w, 0);
     });
 }
