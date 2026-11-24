@@ -350,7 +350,10 @@ static BOOL cpReelAuthorRoot(UIView *v) {
            [n containsString:@"userattribution"] ||
            [n containsString:@"creatorattribution"] ||
            [n containsString:@"authorattribution"] ||
-           [n containsString:@"creatorheader"];
+           [n containsString:@"creatorheader"] ||
+           [n containsString:@"collaboratorattribution"] ||
+           [n containsString:@"collabauthor"] ||
+           [n containsString:@"coauthor"];
 }
 static id cpSafeGetter(id object, NSString *property) {
     if (!object || !property.length) return nil;
@@ -398,6 +401,183 @@ static void cpGatherReel(UIView *v, NSMutableArray<UIView *> *texts,
         cpGatherReel(child, texts, pictures, depth + 1);
     }
 }
+
+// Collab reels can expose a single label "alice and bob", or separate
+// author labels and a stack of overlapping profile-picture views.
+static BOOL cpReelCombinedNames(NSString *value) {
+    if (!value.length || value.length > 240) return NO;
+    NSMutableString *clean = [value mutableCopy];
+    for (NSString *mark in @[@"\u2066", @"\u2067", @"\u2068", @"\u2069",
+                              @"\u200E", @"\u200F", @"\u202A", @"\u202C"])
+        [clean replaceOccurrencesOfString:mark withString:@"" options:0
+                                    range:NSMakeRange(0, clean.length)];
+    NSString *name = @"@?[A-Za-z0-9._]{1,30}";
+    NSString *separator = @"(?:\\s+(?:and|ve|und|et|y|e|en)\\s+|\\s*[,&·+]\\s*)";
+    NSString *pattern = [NSString stringWithFormat:
+        @"^\\s*%@(?:%@%@)+\\s*$", name,
+        separator, name];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern
+                                     options:NSRegularExpressionCaseInsensitive error:NULL];
+    if ([re numberOfMatchesInString:clean options:0
+                              range:NSMakeRange(0,clean.length)] == 0) return NO;
+    // The pattern is for author handles, not metadata or controls.
+    NSString *l = lower(clean);
+    for (NSString *bad in @[@"from openai", @"see more", @"follow", @"view all",
+                             @"original audio", @"paid partnership"])
+        if ([l isEqualToString:bad]) return NO;
+    return YES;
+}
+static BOOL cpReelAuthorText(NSString *s) {
+    return username(s) || cpReelCombinedNames(s);
+}
+static BOOL cpSmallReelPortrait(UIView *v, UIView *root, CGRect *outRect) {
+    if (!v.superview) return NO;
+    CGRect r = [v convertRect:v.bounds toView:root];
+    CGFloat w = r.size.width, h = r.size.height;
+    if (w < 13 || h < 13 || w > 100 || h > 100 ||
+        fabs(w-h) > MAX(w,h)*0.42) return NO;
+    if (outRect) *outRect = r;
+    return YES;
+}
+static void cpCollectCollabPortraits(UIView *root, UIView *v,
+                                     NSMutableOrderedSet<UIView *> *typed,
+                                     NSMutableOrderedSet<UIView *> *generic,
+                                     NSUInteger depth) {
+    if (depth > 10) return;
+    NSString *cls = lower(NSStringFromClass(v.class));
+    BOOL isPortrait = [cls containsString:@"profilepicture"] ||
+                      [cls containsString:@"profilepic"] ||
+                      [cls containsString:@"avatar"];
+    BOOL isImage = [v isKindOfClass:[UIImageView class]] ||
+                   [cls containsString:@"igimageview"];
+    if (cpSmallReelPortrait(v, root, NULL)) {
+        if (isPortrait) [typed addObject:v];
+        else if (isImage) [generic addObject:v];
+    }
+    // Only access known portrait properties, never arbitrary media models.
+    if (depth == 0 || cpReelAuthorRoot(v) || isPortrait ||
+        [cls containsString:@"collab"] || [cls containsString:@"coauthor"]) {
+        for (NSString *getter in @[@"profilePictureImageView", @"profilePictureView",
+                                   @"profilePicView", @"avatarImageView", @"avatarView",
+                                   @"primaryAvatarView", @"secondaryAvatarView",
+                                   @"primaryProfilePictureView", @"secondaryProfilePictureView",
+                                   @"collaboratorAvatarView", @"collaboratorProfilePictureView"]) {
+            UIView *candidate = cpReelSubView(v, getter);
+            if (candidate && cpSmallReelPortrait(candidate, root, NULL))
+                [typed addObject:candidate];
+        }
+    }
+    for (UIView *child in v.subviews)
+        cpCollectCollabPortraits(root, child, typed, generic, depth + 1);
+}
+static BOOL cpCollabNearPortrait(CGRect label, CGRect avatar) {
+    CGFloat dx = CGRectGetMinX(label) - CGRectGetMaxX(avatar);
+    CGFloat dy = fabs(CGRectGetMidY(label) - CGRectGetMidY(avatar));
+    return label.size.width >= 12 && label.size.height >= 8 &&
+           label.size.height <= 58 && dx >= -15 && dx <= 180 &&
+           dy <= MAX(22.0, avatar.size.height * 0.8);
+}
+static void cpApplyReelCollaborators(UIView *author, NSArray<UIView *> *texts,
+                                     UIView *primaryName, UIView *primaryPicture) {
+    NSMutableOrderedSet<UIView *> *portraits = [NSMutableOrderedSet orderedSet];
+    NSMutableOrderedSet<UIView *> *generic = [NSMutableOrderedSet orderedSet];
+    if (primaryPicture && cpSmallReelPortrait(primaryPicture, author, NULL))
+        [portraits addObject:primaryPicture];
+    cpCollectCollabPortraits(author, author, portraits, generic, 0);
+    NSMutableOrderedSet<UIView *> *names = [NSMutableOrderedSet orderedSet];
+    if (primaryName) [names addObject:primaryName];
+
+    // A combined-name label must be a single author-line label located beside
+    // a known portrait (or the original selected author-name view).
+    UIView *combined = nil;
+    CGFloat best = CGFLOAT_MAX;
+    for (UIView *text in texts) {
+        if (!cpReelCombinedNames(cpString(text))) continue;
+        CGRect r = [text convertRect:text.bounds toView:author];
+        if (r.size.height < 8 || r.size.height > 58 || r.size.width < 22) continue;
+        if (text == primaryName) { combined = text; break; }
+        for (UIView *picture in portraits) {
+            CGRect av = [picture convertRect:picture.bounds toView:author];
+            if (!cpCollabNearPortrait(r, av)) continue;
+            CGFloat score = fabs(CGRectGetMidY(r)-CGRectGetMidY(av)) +
+                0.18*fabs(CGRectGetMinX(r)-CGRectGetMaxX(av));
+            if (score < best) { best = score; combined = text; }
+        }
+    }
+    if (combined) [names addObject:combined];
+
+    NSString *rootName = lower(NSStringFromClass(author.class));
+    BOOL collab = combined != nil || [rootName containsString:@"collab"] ||
+                  [rootName containsString:@"coauthor"];
+    // Identify distinct, overlapping/adjacent portrait siblings (not the
+    // nested image and its own wrapper) as evidence of a Collab layout.
+    for (UIView *a in portraits) {
+        for (UIView *b in portraits) {
+            if (a == b || [a isDescendantOfView:b] || [b isDescendantOfView:a]) continue;
+            CGRect ra = [a convertRect:a.bounds toView:author];
+            CGRect rb = [b convertRect:b.bounds toView:author];
+            CGFloat dx = fabs(CGRectGetMidX(ra)-CGRectGetMidX(rb));
+            CGFloat dy = fabs(CGRectGetMidY(ra)-CGRectGetMidY(rb));
+            if (dx <= 1 && dy <= 1) continue;
+            if (dx <= MAX(ra.size.width, rb.size.width)*1.5 &&
+                dy <= MAX(ra.size.height,rb.size.height)*0.8) collab = YES;
+        }
+    }
+
+    if (collab) {
+        UIView *line = combined ?: primaryName;
+        CGRect lineRect = line ? [line convertRect:line.bounds toView:author] : CGRectNull;
+        // Secondary avatars may be generic image views: include only those
+        // overlapping the same left-hand avatar cluster, or immediately
+        // left of the identified author-name line. Never hide music artwork.
+        NSArray<UIView *> *anchors = portraits.array;
+        for (UIView *image in generic) {
+            CGRect ri = [image convertRect:image.bounds toView:author];
+            BOOL matched = NO;
+            if (line && cpCollabNearPortrait(lineRect, ri) &&
+                CGRectGetMidX(ri) < CGRectGetMinX(lineRect) &&
+                CGRectGetMinX(lineRect)-CGRectGetMaxX(ri) <= 65) matched = YES;
+            for (UIView *anchor in anchors) {
+                CGRect ra = [anchor convertRect:anchor.bounds toView:author];
+                CGFloat dx = fabs(CGRectGetMidX(ra)-CGRectGetMidX(ri));
+                CGFloat dy = fabs(CGRectGetMidY(ra)-CGRectGetMidY(ri));
+                if (dx <= MAX(ra.size.width,ri.size.width)*1.6 &&
+                    dy <= MAX(ra.size.height,ri.size.height)*0.85 &&
+                    ri.size.width >= ra.size.width*0.40) matched = YES;
+            }
+            if (matched) [portraits addObject:image];
+        }
+        // Separate name labels are only accepted on the same author line
+        // and near the existing confirmed name. Never use a full reel scan.
+        if (line) {
+            for (UIView *text in texts) {
+                NSString *value = cpString(text);
+                if (!cpReelAuthorText(value)) continue;
+                CGRect r = [text convertRect:text.bounds toView:author];
+                if (r.size.height < 8 || r.size.height > 58) continue;
+                CGFloat dy = fabs(CGRectGetMidY(r)-CGRectGetMidY(lineRect));
+                if (dy > MAX(8.0,lineRect.size.height*0.6)) continue;
+                if (CGRectGetMinX(r) < CGRectGetMinX(lineRect)-10 ||
+                    CGRectGetMinX(r) > CGRectGetMaxX(lineRect)+150) continue;
+                // Exclude standard action words even in localized layouts.
+                NSString *l = lower(value);
+                if ([@[@"follow", @"following", @"takip", @"takip et", @"seguir",
+                        @"suivre", @"folgen", @"see more", @"more"] containsObject:l]) continue;
+                [names addObject:text];
+            }
+        }
+    }
+
+    for (UIView *name in names) privateAlpha(name, enabled(kReelNames));
+    // Preserve the original single-avatar behavior on non-Collab reels.
+    if (collab) {
+        for (UIView *picture in portraits) {
+            // Keep the whole portrait stack hidden, not just the front image.
+            privateAlpha(picture, enabled(kReelAvatars));
+        }
+    }
+}
+
 static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay) {
     if (!author.window || (!confirmedByReelOverlay && !cpReelAuthorRoot(author))) return;
     NSString *cls = lower(NSStringFromClass(author.class));
@@ -423,7 +603,7 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
                                @"nameLabel", @"nameTextView",
                                @"authorTextView"]) {
         UIView *candidate = cpReelSubView(author, getter);
-        if (candidate && username(cpString(candidate))) {
+        if (candidate && cpReelAuthorText(cpString(candidate))) {
             nameView = candidate;
             break;
         }
@@ -452,7 +632,7 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
             if (([name containsString:@"username"] ||
                  [name containsString:@"authorname"] ||
                  [identifier containsString:@"username"]) &&
-                 username(cpString(view))) {
+                 cpReelAuthorText(cpString(view))) {
                 nameView = view;
                 break;
             }
@@ -497,9 +677,9 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
             for (UIView *candidate in texts) {
                 NSString *value = [cpString(candidate) stringByTrimmingCharactersInSet:
                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (!username(value)) continue; // Follow / See more excluded
+                if (!cpReelAuthorText(value)) continue; // Follow / See more excluded
                 CGRect r = [candidate convertRect:candidate.bounds toView:author];
-                if (r.size.width < 18 || r.size.width > 350 ||
+                if (r.size.width < 18 || r.size.width > MAX(350.0, author.bounds.size.width) ||
                     r.size.height < 9 || r.size.height > 65) continue;
                 CGFloat dx = CGRectGetMinX(r) - CGRectGetMaxX(av);
                 CGFloat dy = fabs(CGRectGetMidY(r) - CGRectGetMidY(av));
@@ -542,6 +722,7 @@ static void cpApplyReelAuthorChecked(UIView *author, BOOL confirmedByReelOverlay
     }
     if (nameView) privateAlpha(nameView, enabled(kReelNames));
     if (pictureView) privateAlpha(pictureView, enabled(kReelAvatars));
+    cpApplyReelCollaborators(author, texts, nameView, pictureView);
 }
 static void cpApplyReelAuthor(UIView *author) {
     cpApplyReelAuthorChecked(author, NO);
