@@ -1510,6 +1510,59 @@ static void refresh(void) {
     });
 }
 
+
+// Manual on-screen capture, taken BEFORE the privacy sheet is presented.
+// Keep only class names, parent classes, sizes and drawing flags. Never
+// include text, accessibility labels, image contents or account identifiers.
+static NSString *cpManualAudioReport;
+static void cpManualRailViews(UIView *v, UIWindow *w, NSMutableArray<NSString *> *rows,
+                               NSUInteger depth, NSUInteger *visited) {
+    if (depth>28 || (*visited)++>6000 || rows.count>=90 || !cpTransientVisible(v,w)) return;
+    CGRect r=[v convertRect:v.bounds toView:w];
+    CGRect b=w.bounds;
+    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
+    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
+    if (x>=0.78 && y>=0.40 && y<=0.96 && r.size.width>=8 && r.size.width<=130 &&
+        r.size.height>=8 && r.size.height<=150) {
+        [rows addObject:[NSString stringWithFormat:
+          @"V %@ parent=%@ %@ alpha=%.2f hidden=%d corner=%.1f border=%.1f picture=%d mask=%d",
+          NSStringFromClass(v.class),NSStringFromClass(v.superview.class),NSStringFromCGRect(r),
+          v.alpha,v.hidden,v.layer.cornerRadius,v.layer.borderWidth,
+          cpAudioHasPicture(v.layer,0),v.layer.mask!=nil]];
+    }
+    for (UIView *child in v.subviews) cpManualRailViews(child,w,rows,depth+1,visited);
+}
+static void cpManualRailLayers(CALayer *l, UIWindow *w, NSMutableArray<NSString *> *rows,
+                                NSUInteger depth, NSUInteger *visited) {
+    if (depth>30||(*visited)++>8000||rows.count>=65) return;
+    CGRect r=[l convertRect:l.bounds toLayer:w.layer];
+    CGRect b=w.bounds;
+    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
+    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
+    if (x>=0.82&&y>=0.58&&y<=0.96&&r.size.width>=12&&r.size.width<=85&&
+        r.size.height>=12&&r.size.height<=85) {
+        id owner=l.delegate;
+        [rows addObject:[NSString stringWithFormat:
+          @"L %@ owner=%@ %@ opacity=%.2f hidden=%d corner=%.1f border=%.1f contents=%d mask=%d",
+          NSStringFromClass(l.class),owner?NSStringFromClass([owner class]):@"none",
+          NSStringFromCGRect(r),l.opacity,l.hidden,l.cornerRadius,l.borderWidth,
+          l.contents!=nil,l.mask!=nil]];
+    }
+    for (CALayer *child in l.sublayers) cpManualRailLayers(child,w,rows,depth+1,visited);
+}
+static void cpCaptureManualRail(UIWindow *w) {
+    if (!w || ![NSThread isMainThread]) return;
+    NSMutableArray<NSString *> *views=[NSMutableArray array],*layers=[NSMutableArray array];
+    NSUInteger visits=0,layerVisits=0;
+    cpManualRailViews(w,w,views,0,&visits);
+    cpManualRailLayers(w.layer,w,layers,0,&layerVisits);
+    cpManualAudioReport=[NSString stringWithFormat:
+        @"Manual right rail v4: window=%@ audioToggle=%d views=%lu layers=%lu\n%@\n%@\nPrevious automatic scan:\n%@",
+        NSStringFromCGRect(w.bounds),enabled(kReelAudio),(unsigned long)views.count,
+        (unsigned long)layers.count,[views componentsJoinedByString:@"\n"],
+        [layers componentsJoinedByString:@"\n"],cpTransientReport?:@"none"];
+}
+
 @interface CPMenu : UITableViewController
 @end
 @implementation CPMenu
@@ -1575,7 +1628,7 @@ static void refresh(void) {
     refresh();
 }
 - (void)copyAudioDebug {
-    [UIPasteboard generalPasteboard].string = cpTransientReport ?: @"Reels portrait v3: no visible Reels scan yet";
+    [UIPasteboard generalPasteboard].string = cpManualAudioReport ?: cpTransientReport ?: @"Reels portrait v4: no visible Reels scan yet";
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Audio diagnostics copied"
         message:@"Paste this report if the right-hand portrait is still visible. It contains only view classes and geometry."
         preferredStyle:UIAlertControllerStyleAlert];
@@ -1622,14 +1675,17 @@ static UIViewController *topController(void) {
         ([top isKindOfClass:[UINavigationController class]] &&
          [[(UINavigationController *)top topViewController] isKindOfClass:[CPMenu class]]))
         return;
+    if (press.numberOfTouchesRequired==2 || cpAudioScope(press.view) || cpAudioScope(press.view.superview))
+        cpCaptureManualRail(press.view.window ?: ([press.view isKindOfClass:[UIWindow class]] ? (UIWindow *)press.view : nil));
     UINavigationController *nav = [[UINavigationController alloc]
         initWithRootViewController:[[CPMenu alloc] init]];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [top presentViewController:nav animated:YES completion:nil];
 }
 @end
-static void attach(UIView *v) {
-    if (objc_getAssociatedObject(v, &kGesture) || !commentButton(v)) return;
+static void cpAttachCommentControl(UIView *v, BOOL confirmed) {
+    if (!v || !v.window || objc_getAssociatedObject(v,&kGesture) ||
+        (!confirmed && !commentButton(v))) return;
     UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[CPAction shared] action:@selector(open:)];
     press.minimumPressDuration = 0.55;
@@ -1637,11 +1693,49 @@ static void attach(UIView *v) {
     [v addGestureRecognizer:press];
     objc_setAssociatedObject(v, &kGesture, press, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
+static void attach(UIView *v) {
+    cpAttachCommentControl(v,NO);
+    if (!v.window || (!cpAudioScope(v) && !cpAudioScope(v.superview))) return;
+    // Native Reels UFI can use a generic control with no button title.
+    if (cpAudioRoot(v)) {
+        for (NSString *key in @[@"commentButton",@"commentsButton",@"commentControl",
+                                 @"commentCountBouncyButton",@"commentCountButton",
+                                 @"commentActionButton",@"commentActionView"]) {
+            UIView *control=cpAudioGetterView(v,key);
+            if (control && control!=v) cpAttachCommentControl(control,YES);
+        }
+    }
+    NSString *n=lower(NSStringFromClass(v.class));
+    NSString *i=lower(v.accessibilityIdentifier);
+    NSString *l=lower(v.accessibilityLabel);
+    BOOL exact=[n containsString:@"commentbutton"]||[n containsString:@"commentcontrol"]||
+        [i containsString:@"comment_button"]||[i containsString:@"commentbutton"]||
+        [i containsString:@"comment_action"]||[i containsString:@"comments_button"]||
+        [l hasPrefix:@"comments,"]||[l hasPrefix:@"comment,"]||
+        [l hasPrefix:@"view comments"]||[l hasPrefix:@"yorumları gör"];
+    if (exact && cpAudioRailRect(v,NULL)) cpAttachCommentControl(v,YES);
+}
+// Independent fallback: hold TWO fingers still anywhere on the Instagram
+// window. This works even when the Reels comment control is not a UIView.
+static char kWindowPrivacyGesture;
+static void cpInstallWindowPrivacyGesture(UIWindow *w) {
+    if (!w || objc_getAssociatedObject(w,&kWindowPrivacyGesture)) return;
+    UILongPressGestureRecognizer *press=[[UILongPressGestureRecognizer alloc]
+        initWithTarget:[CPAction shared] action:@selector(open:)];
+    press.numberOfTouchesRequired=2;
+    press.minimumPressDuration=0.65;
+    press.allowableMovement=12;
+    press.cancelsTouchesInView=NO;
+    press.delaysTouchesBegan=NO;
+    [w addGestureRecognizer:press];
+    objc_setAssociatedObject(w,&kWindowPrivacyGesture,press,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
 static void didMove(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalMove)(self, cmd);
     if (objc_getAssociatedObject(self,&kAudioAlpha) &&
         (!self.window || !cpAudioScope(self) || !enabled(kReelAudio))) cpAudioAlpha(self,NO);
     if (!self.window) return;
+    cpInstallWindowPrivacyGesture(self.window);
     attach(self);
     if (enabled(kReelAudio) && (cpAudioRoot(self) || cpAudioNamed(self) ||
                                cpAudioImageView(self) || cpAudioBookmark(self))) {
@@ -1681,6 +1775,7 @@ static void setIdentifier(UIView *self, SEL cmd, NSString *value) {
 static void genericLayout(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalAnyLayout)(self, cmd);
     if (changingRenderedText || !self.window) return;
+    if (cpAudioRoot(self)) attach(self);
     if (commentRow(self)) applyRow(self);
     if (cpReelAuthorRoot(self)) cpApplyReelAuthor(self);
     if (cpReelOverlayRoot(self)) cpApplyReelOverlay(self);
@@ -1777,8 +1872,10 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)tableLayout, &originalTableLayout);
             swapMethod([UICollectionViewCell class], @selector(layoutSubviews),
                        (IMP)collectionLayout, &originalCollectionLayout);
+            for (UIWindow *w in [UIApplication sharedApplication].windows)
+                cpInstallWindowPrivacyGesture(w);
             cpTransientUpdateTimer();
-            NSLog(@"[CommentPrivacy] loaded; five independent toggles; transient audio portrait v3");
+            NSLog(@"[CommentPrivacy] loaded; five toggles; two-finger menu and manual audio diagnostics v4");
         });
     }
 }
