@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <QuartzCore/QuartzCore.h>
 
 // Independent experimental Instagram tweak. RyukGram itself is not modified.
 static NSString *const kNames = @"CPHideCommentUsernames";
@@ -12,7 +13,7 @@ static NSString *const kReelAudio = @"CPHideReelAudioThumbnail";
 static char kGesture, kPriorAlpha, kInlineOriginal, kInlineRendered;
 static IMP originalMove, originalTableLayout, originalCollectionLayout, originalAnyLayout;
 static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
-static IMP originalAudioImage;
+static IMP originalAudioImage, originalAudioControllerLayout;
 static BOOL changingRenderedText = NO;
 
 static NSString *lower(NSString *s) {
@@ -836,8 +837,27 @@ static void cpRefreshReelFromText(UIView *text) {
 // Independent toggle for the small audio artwork / Original Audio entry
 // point at the bottom of the RIGHT Reels action rail. Do not hide the
 // left-hand song attribution, change playback, or hide arbitrary images.
-static char kAudioAlpha, kAudioPending, kAudioSelection;
+static char kAudioAlpha, kAudioPending, kAudioSelection, kAudioLayerState, kAudioLayerSelection;
 static NSHashTable<UIView *> *cpAudioHidden;
+static NSHashTable<CALayer *> *cpAudioHiddenLayers;
+static BOOL cpAudioViewerController(id object) {
+    if (![object isKindOfClass:[UIViewController class]]) return NO;
+    NSString *n=lower(NSStringFromClass([object class]));
+    if ([n containsString:@"comment"] || [n containsString:@"editor"] ||
+        [n containsString:@"capture"] || [n containsString:@"creation"] ||
+        [n containsString:@"audio"] || [n containsString:@"profile"]) return NO;
+    return [n containsString:@"sundialfeedviewcontroller"] ||
+           [n containsString:@"sundialviewerviewcontroller"] ||
+           [n containsString:@"reelsviewerviewcontroller"] ||
+           [n containsString:@"clipsviewerviewcontroller"];
+}
+static BOOL cpAudioViewerCell(UIView *v) {
+    NSString *n=lower(NSStringFromClass(v.class));
+    return ([n containsString:@"sundialviewer"] || [n containsString:@"sundialfeed"] ||
+            [n containsString:@"reelsviewer"] || [n containsString:@"clipsviewer"]) &&
+           ([n containsString:@"videocell"] || [n containsString:@"reelcell"] ||
+            [n containsString:@"feedcell"] || [n containsString:@"vieweritem"]);
+}
 static BOOL cpAudioRoot(UIView *v) {
     NSString *n = lower(NSStringFromClass(v.class));
     if (commentRow(v) || [n containsString:@"comment"] ||
@@ -849,10 +869,11 @@ static BOOL cpAudioRoot(UIView *v) {
     BOOL controls = [n containsString:@"ufi"] || [n containsString:@"actionrail"] ||
                     [n containsString:@"actionbar"] || [n containsString:@"interactionbar"] ||
                     [n containsString:@"rightcontrols"] || [n containsString:@"controlsoverlay"];
-    return reel && controls;
+    return (reel && controls) || cpAudioViewerCell(v) ||
+           cpAudioViewerController(v.nextResponder);
 }
-// Select a single outer control scope rather than independently hiding
-// different images in both a nested UFI view and its parent overlay.
+// The artwork can be a sibling of the historical controls overlay. Prefer
+// the enclosing native Reel cell, then its dedicated viewer controller.
 static UIView *cpAudioScope(UIView *view) {
     UIView *root = nil;
     for (UIView *v = view; v && v != view.window; v = v.superview) {
@@ -860,7 +881,8 @@ static UIView *cpAudioScope(UIView *view) {
         if ([n containsString:@"comment"] || [n containsString:@"editor"] ||
             [n containsString:@"capture"] || [n containsString:@"creation"]) break;
         if (cpAudioRoot(v)) root = v;
-        if (cpReelOverlayRoot(v)) break;
+        if (cpAudioViewerCell(v)) return v;
+        if ([v.nextResponder isKindOfClass:[UIViewController class]]) break;
     }
     return root;
 }
@@ -897,7 +919,9 @@ static BOOL cpAudioBookmark(UIView *v) {
            [i isEqualToString:@"save"] || [l isEqualToString:@"save"] ||
            [l isEqualToString:@"saved"] || [l isEqualToString:@"unsave"] ||
            [l hasPrefix:@"save reel"] || [l hasPrefix:@"remove from saved"] ||
-           [l isEqualToString:@"kaydet"] || [l isEqualToString:@"kaydedildi"];
+           [l hasPrefix:@"save,"] || [l hasPrefix:@"save "] ||
+           [l hasPrefix:@"saved,"] || [l hasPrefix:@"unsave "] ||
+           [l hasPrefix:@"kaydet"] || [l isEqualToString:@"kaydedildi"];
 }
 static BOOL cpAudioRailRect(UIView *v, CGRect *outRect) {
     UIWindow *w = v.window;
@@ -977,9 +1001,142 @@ static void cpAudioAlpha(UIView *v, BOOL hide) {
         [cpAudioHidden removeObject:v];
     }
 }
+
+// View hierarchies in newer versions may draw the artwork using a
+// CALayer-backed generic UIView, not an UIImageView or audio-named button.
+static BOOL cpAudioInWindow(UIView *v, UIView *root) {
+    for (UIView *p=v; p; p=p.superview) {
+        if (p.hidden || (p.alpha<0.01 && !objc_getAssociatedObject(p,&kAudioAlpha)))
+            return NO;
+        if (p==root) return YES;
+    }
+    return NO;
+}
+static BOOL cpAudioLayerRect(CALayer *layer, UIWindow *window, CGRect *outRect) {
+    if (!layer.superlayer || !window) return NO;
+    CGRect r=[layer convertRect:layer.bounds toLayer:window.layer];
+    CGRect b=window.bounds;
+    if (!isfinite(r.origin.x) || !isfinite(r.origin.y) ||
+        r.size.width<18 || r.size.height<18 || r.size.width>48 || r.size.height>48 ||
+        fabs(r.size.width-r.size.height)>MAX(r.size.width,r.size.height)*0.22 ||
+        CGRectGetMidX(r)<b.size.width*0.87 ||
+        CGRectGetMidY(r)<b.size.height*0.58 || CGRectGetMidY(r)>b.size.height*0.94)
+        return NO;
+    if (outRect) *outRect=r;
+    return YES;
+}
+static BOOL cpAudioRounded(CALayer *layer) {
+    return layer.cornerRadius>=2 && layer.cornerRadius<=MIN(layer.bounds.size.width,layer.bounds.size.height)*0.42;
+}
+static BOOL cpAudioHasPicture(CALayer *layer, NSUInteger depth) {
+    if (depth>4) return NO;
+    if (layer.contents) return YES;
+    for (CALayer *child in layer.sublayers)
+        if (cpAudioHasPicture(child,depth+1)) return YES;
+    return NO;
+}
+static BOOL cpAudioArtworkView(UIView *v) {
+    CGRect r;
+    if (!cpAudioLayerRect(v.layer,v.window,&r) || cpAudioBookmark(v)) return NO;
+    if ([v isKindOfClass:[UIImageView class]] &&
+        ((UIImageView *)v).image.renderingMode==UIImageRenderingModeAlwaysTemplate) return NO;
+    CALayer *l=v.layer;
+    // A rounded square with a real picture (or an explicitly bordered
+    // artwork wrapper) differs from ordinary unframed action glyphs.
+    return (cpAudioRounded(l) && (cpAudioHasPicture(l,0) || l.borderWidth>=0.5)) ||
+           (l.borderWidth>=0.5 && cpAudioHasPicture(l,0));
+}
+static void cpAudioCollectRail(UIView *v, UIView *root,
+                               NSMutableArray<UIView *> *controls,
+                               NSMutableArray<UIView *> *artwork,
+                               NSUInteger depth, NSUInteger *visited) {
+    if (depth>18 || (*visited)++>1800 || !cpAudioInWindow(v,root)) return;
+    NSString *n=lower(NSStringFromClass(v.class));
+    if (v!=root && (cpReelAuthorRoot(v) || [n containsString:@"comment"] ||
+        [n containsString:@"caption"] || [n containsString:@"socialcontext"] ||
+        (cpAudioViewerCell(v) && cpAudioScope(v)!=root))) return;
+    CGRect r;
+    if (v!=root && cpAudioRailRect(v,&r)) {
+        BOOL button=[v isKindOfClass:[UIControl class]] ||
+                    (v.accessibilityTraits & UIAccessibilityTraitButton) ||
+                    [n containsString:@"button"] || cpAudioBookmark(v);
+        if (button) [controls addObject:v];
+        if (cpAudioArtworkView(v)) [artwork addObject:v];
+    }
+    for (UIView *child in v.subviews)
+        cpAudioCollectRail(child,root,controls,artwork,depth+1,visited);
+}
+static BOOL cpAudioBelowRail(CGRect r, NSArray<UIView *> *controls) {
+    CGFloat lastY=-1000;
+    NSUInteger distinct=0;
+    NSMutableArray<NSNumber *> *ys=[NSMutableArray array];
+    for (UIView *c in controls) {
+        CGRect b;
+        if (!cpAudioRailRect(c,&b) || fabs(CGRectGetMidX(r)-CGRectGetMidX(b))>22) continue;
+        CGFloat dy=CGRectGetMidY(r)-CGRectGetMidY(b);
+        if (dy<24 || dy>420) continue;
+        if (cpAudioBookmark(c) && dy<=125) return YES;
+        [ys addObject:@(CGRectGetMidY(b))];
+    }
+    for (NSNumber *y in [ys sortedArrayUsingSelector:@selector(compare:)]) {
+        if (y.doubleValue-lastY>23) { distinct++; lastY=y.doubleValue; }
+    }
+    return distinct>=2 && CGRectGetMidY(r)-lastY<=125;
+}
+static UIView *cpAudioFallbackView(UIView *root, NSArray<UIView *> **outControls) {
+    NSMutableArray<UIView *> *controls=[NSMutableArray array];
+    NSMutableArray<UIView *> *artwork=[NSMutableArray array];
+    NSUInteger visited=0;
+    cpAudioCollectRail(root,root,controls,artwork,0,&visited);
+    if (outControls) *outControls=controls;
+    UIView *best=nil;
+    CGFloat score=-CGFLOAT_MAX;
+    for (UIView *v in artwork) {
+        CGRect r;
+        if (!cpAudioLayerRect(v.layer,v.window,&r) || !cpAudioBelowRail(r,controls)) continue;
+        CGFloat value=CGRectGetMidY(r)+(v.layer.borderWidth>=0.5?5:0);
+        if (value>score) {score=value;best=v;}
+    }
+    return best;
+}
+static void cpAudioSetLayer(CALayer *layer, BOOL hide) {
+    if (!layer) return;
+    NSNumber *prior=objc_getAssociatedObject(layer,&kAudioLayerState);
+    if (hide) {
+        if (!cpAudioHiddenLayers) cpAudioHiddenLayers=[NSHashTable weakObjectsHashTable];
+        [cpAudioHiddenLayers addObject:layer];
+        if (!prior) objc_setAssociatedObject(layer,&kAudioLayerState,@(layer.hidden),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!layer.hidden) layer.hidden=YES;
+    } else {
+        if (prior) {
+            objc_setAssociatedObject(layer,&kAudioLayerState,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            layer.hidden=prior.boolValue;
+        }
+        [cpAudioHiddenLayers removeObject:layer];
+    }
+}
+static void cpAudioFindArtworkLayer(CALayer *layer, UIWindow *w,
+                                    NSArray<UIView *> *controls, CALayer **best,
+                                    CGFloat *bestScore, NSUInteger depth, NSUInteger *visited) {
+    if (depth>23 || (*visited)++>3500 ||
+        (layer.hidden && !objc_getAssociatedObject(layer,&kAudioLayerState))) return;
+    CGRect r;
+    // Standalone layer artwork can carry its own border and corner radius.
+    // Only hide a bounded square below confirmed controls; never a video layer.
+    if (cpAudioLayerRect(layer,w,&r) && cpAudioRounded(layer) &&
+        layer.borderWidth>=0.5 && cpAudioHasPicture(layer,0) &&
+        cpAudioBelowRail(r,controls)) {
+        CGFloat score=CGRectGetMidY(r);
+        if (score>*bestScore) { *bestScore=score; *best=layer; }
+    }
+    for (CALayer *child in layer.sublayers)
+        cpAudioFindArtworkLayer(child,w,controls,best,bestScore,depth+1,visited);
+}
+
 static void cpRestoreDisabledAudio(void) {
     if (enabled(kReelAudio)) return;
     for (UIView *v in cpAudioHidden.allObjects) cpAudioAlpha(v,NO);
+    for (CALayer *layer in cpAudioHiddenLayers.allObjects) cpAudioSetLayer(layer,NO);
 }
 // If the actual image lives in a small audio button, hide the entire
 // button (including its outline), not the rest of the vertical action bar.
@@ -1036,7 +1193,27 @@ static void cpApplyReelAudio(UIView *root) {
             }
         }
     }
+    NSArray<UIView *> *railControls=nil;
+    if (!chosen) chosen=cpAudioFallbackView(root,&railControls);
+    CALayer *chosenLayer=nil;
+    if (!chosen && railControls.count>=2) {
+        CGFloat bestLayer=-CGFLOAT_MAX;
+        NSUInteger layerVisited=0;
+        cpAudioFindArtworkLayer(root.layer,root.window,railControls,&chosenLayer,&bestLayer,0,&layerVisited);
+    }
     if (chosen) chosen=cpAudioPromote(chosen,root);
+    NSHashTable<CALayer *> *oldLayers=objc_getAssociatedObject(root,&kAudioLayerSelection);
+    for (CALayer *old in oldLayers.allObjects)
+        if (old!=chosenLayer) cpAudioSetLayer(old,NO);
+    if (!oldLayers && chosenLayer) {
+        oldLayers=[NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(root,&kAudioLayerSelection,oldLayers,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [oldLayers removeAllObjects];
+    if (chosenLayer) {
+        [oldLayers addObject:chosenLayer];
+        cpAudioSetLayer(chosenLayer,YES);
+    }
     // Restore the old selection when a recycled reel changes its artwork
     // or when this layout no longer identifies the audio entry point.
     NSHashTable<UIView *> *previous=objc_getAssociatedObject(root,&kAudioSelection);
@@ -1245,9 +1422,15 @@ static void genericLayout(UIView *self, SEL cmd) {
     if (cpReelOverlayRoot(self)) cpApplyReelOverlay(self);
     if (enabled(kReelAudio)) {
         if (cpAudioRoot(self)) cpApplyReelAudio(self);
-        else if (objc_getAssociatedObject(self,&kAudioAlpha) || cpAudioNamed(self))
+        else if (objc_getAssociatedObject(self,&kAudioAlpha) || cpAudioNamed(self) ||
+                 (cpAudioRailRect(self,NULL) && cpAudioArtworkView(self)))
             cpScheduleReelAudio(self);
     }
+}
+static void audioControllerLayout(UIViewController *self, SEL cmd) {
+    ((void (*)(id, SEL))originalAudioControllerLayout)(self,cmd);
+    if (enabled(kReelAudio) && cpAudioViewerController(self) && self.isViewLoaded)
+        cpScheduleReelAudio(self.view);
 }
 static void audioImage(UIImageView *self, SEL cmd, UIImage *image) {
     ((void (*)(id, SEL, id))originalAudioImage)(self,cmd,image);
@@ -1308,6 +1491,8 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)didMove, &originalMove);
             swapMethod([UIView class], @selector(layoutSubviews),
                        (IMP)genericLayout, &originalAnyLayout);
+            swapMethod([UIViewController class], @selector(viewDidLayoutSubviews),
+                       (IMP)audioControllerLayout, &originalAudioControllerLayout);
             swapMethod([UIImageView class], @selector(setImage:),
                        (IMP)audioImage, &originalAudioImage);
             swapMethod([UILabel class], @selector(setText:),
