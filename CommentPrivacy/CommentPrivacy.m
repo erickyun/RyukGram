@@ -15,6 +15,8 @@ static IMP originalMove, originalTableLayout, originalCollectionLayout, original
 static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
 static IMP originalAudioImage, originalAudioControllerLayout;
 static IMP originalTransientHidden, originalTransientContents, originalTransientAnimation;
+static IMP originalNativeLayout, originalNativeMove, originalNativeSuperview;
+static IMP originalNativeBounds, originalNativeFrame;
 static BOOL changingRenderedText = NO;
 
 static NSString *lower(NSString *s) {
@@ -1249,7 +1251,7 @@ static void cpScheduleReelAudio(UIView *view) {
 // old overlay subtree and animate its visibility after video playback starts.
 // Confirm a visible Reels viewer in the window, then examine only a small
 // right-rail artwork slot. No video pixels, usernames or network data read.
-static char kTransientPortrait;
+static char kTransientPortrait, kNativeSlotParent;
 static NSHashTable<CALayer *> *cpTransientLayers;
 static NSTimer *cpTransientTimer;
 static BOOL cpTransientScanning;
@@ -1364,13 +1366,15 @@ static void cpTransientSet(CALayer *l, BOOL hide) {
         if (!prior) objc_setAssociatedObject(l,&kTransientPortrait,@(l.hidden),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (!l.hidden) {
             [CATransaction begin];[CATransaction setDisableActions:YES];
-            l.hidden=YES;[CATransaction commit];
+            ((void(*)(id,SEL,BOOL))originalTransientHidden)(l,@selector(setHidden:),YES);
+            [CATransaction commit];
         }
     } else if (prior) {
         objc_setAssociatedObject(l,&kTransientPortrait,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [cpTransientLayers removeObject:l];
         [CATransaction begin];[CATransaction setDisableActions:YES];
-        l.hidden=prior.boolValue;[CATransaction commit];
+        ((void(*)(id,SEL,BOOL))originalTransientHidden)(l,@selector(setHidden:),prior.boolValue);
+        [CATransaction commit];
     }
 }
 static void cpTransientRestore(void) {
@@ -1447,11 +1451,11 @@ static CALayer *cpNativeCommonRail(CALayer *a,CALayer *b,UIWindow *w) {
     }
     return nil;
 }
-static CALayer *cpNativeChoose(UIWindow *w) {
+static NSArray<CALayer *> *cpNativeChoose(UIWindow *w) {
     NSMutableArray<CALayer *> *counted=[NSMutableArray array],*terminal=[NSMutableArray array];
     NSUInteger visits=0;
     cpNativeCollect(w.layer,w,counted,terminal,0,&visits);
-    CALayer *best=nil;CGFloat bestY=-CGFLOAT_MAX;
+    NSMutableArray<CALayer *> *matched=[NSMutableArray array];
     for (CALayer *candidate in terminal) {
         CGRect r; if (!cpNativeRailRect(candidate,w,&r)) continue;
         NSMutableArray<NSNumber *> *ys=[NSMutableArray array];
@@ -1472,9 +1476,9 @@ static CALayer *cpNativeChoose(UIWindow *w) {
         for (NSNumber *y in [ys sortedArrayUsingSelector:@selector(compare:)]) {
             if (y.doubleValue-last>30) {distinct++;last=y.doubleValue;}
         }
-        if (near&&distinct>=2&&CGRectGetMidY(r)>bestY) {best=candidate;bestY=CGRectGetMidY(r);}
+        if (near&&distinct>=2) [matched addObject:candidate];
     }
-    return best;
+    return matched;
 }
 static BOOL cpNativeDescendant(CALayer *layer,CALayer *ancestor) {
     for (CALayer *p=layer;p;p=p.superlayer) if (p==ancestor) return YES;
@@ -1504,6 +1508,125 @@ static void cpNativeSlotArtwork(CALayer *l, UIWindow *w, CALayer *button, CGRect
     for (CALayer *child in l.sublayers) cpNativeSlotArtwork(child,w,button,slot,targets,depth+1,visits);
 }
 
+static void cpTransientSchedule(void);
+
+// The Swift UFI is reused across reels. Identify the terminal control in
+// local rail coordinates before a scroll moves it into the window viewport.
+// Never identify a 44x44 interaction button just by its class.
+static BOOL cpNativeLocalIdentity(CALayer *l) {
+    NSString *n=cpNativeOwner(l);
+    if (![n hasSuffix:@".IGSundialUFIButton"] &&
+        ![n isEqualToString:@"IGSundialUFIButton"]) return NO;
+    CGSize z=l.bounds.size;
+    if (z.width<34||z.width>48||z.height<43||z.height>58||
+        z.height-z.width<5||z.height-z.width>16) return NO;
+    id d=l.delegate;
+    if (![d isKindOfClass:[UIView class]]) return NO;
+    UIView *v=d;
+    if (cpAudioBookmark(v)) return NO;
+    NSString *label=lower(v.accessibilityLabel),*ident=lower(v.accessibilityIdentifier);
+    for (NSString *bad in @[@"like",@"comment",@"share",@"repost",@"send",@"more options",
+                              @"bookmark",@"save",@"beğen",@"yorum",@"paylaş",@"kaydet"])
+        if ([label hasPrefix:bad]||[ident hasPrefix:bad]) return NO;
+    return YES;
+}
+static void cpNativeLocalRows(CALayer *l,CALayer *root,CALayer *candidate,CGRect target,
+                              NSMutableArray<NSNumber *> *rows,BOOL *near,
+                              NSUInteger depth,NSUInteger *visits) {
+    if (depth>10||(*visits)++>550||l==candidate) return;
+    if (cpNativeCounted(l)) {
+        CGRect b=[l convertRect:l.bounds toLayer:root];
+        CGFloat dx=fabs(CGRectGetMidX(target)-CGRectGetMidX(b));
+        CGFloat dy=CGRectGetMidY(target)-CGRectGetMidY(b);
+        CGFloat gap=CGRectGetMinY(target)-CGRectGetMaxY(b);
+        if (b.size.width>=30&&b.size.width<=60&&b.size.height>=50&&b.size.height<=90&&
+            dx<=12&&dy>=28&&dy<=230) {
+            [rows addObject:@(CGRectGetMidY(b))];
+            if (gap>=-8&&gap<=32&&dx<=5) *near=YES;
+        }
+        return;
+    }
+    for (CALayer *child in l.sublayers)
+        cpNativeLocalRows(child,root,candidate,target,rows,near,depth+1,visits);
+}
+static BOOL cpNativeLocalConfirmed(CALayer *l) {
+    if (!l.superlayer||!cpNativeLocalIdentity(l)) return NO;
+    for (CALayer *p=l.superlayer; p; p=p.superlayer) {
+        if ([p.delegate isKindOfClass:[UIWindow class]]) break;
+        // A shared compact rail can be evaluated even while offscreen.
+        if (p.bounds.size.width>10&&p.bounds.size.width<=180&&p.bounds.size.height>45) {
+            CGRect r=[l convertRect:l.bounds toLayer:p];
+            NSMutableArray<NSNumber *> *rows=[NSMutableArray array];
+            BOOL near=NO;NSUInteger visits=0;
+            cpNativeLocalRows(p,p,l,r,rows,&near,0,&visits);
+            NSUInteger distinct=0;CGFloat last=-1000;
+            for (NSNumber *y in [rows sortedArrayUsingSelector:@selector(compare:)]) {
+                if (y.doubleValue-last>30) {distinct++;last=y.doubleValue;}
+            }
+            // A single counted row in the same narrow rail is sufficient
+            // for the exact 40x48 native slot when another count is absent.
+            if (near&&(distinct>=2||(distinct==1&&fabs(l.bounds.size.width-40)<=1&&
+                fabs(l.bounds.size.height-48)<=1))) return YES;
+        }
+        if (p.bounds.size.width>220) break;
+    }
+    return NO;
+}
+static BOOL cpNativeRetained(CALayer *l) {
+    NSHashTable<CALayer *> *parent=objc_getAssociatedObject(l,&kNativeSlotParent);
+    return l.superlayer&&[parent containsObject:l.superlayer]&&cpNativeLocalIdentity(l);
+}
+static void cpNativeRemember(CALayer *l) {
+    if (!l.superlayer) return;
+    NSHashTable<CALayer *> *parent=[NSHashTable weakObjectsHashTable];
+    [parent addObject:l.superlayer];
+    objc_setAssociatedObject(l,&kNativeSlotParent,parent,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static void cpNativeForget(CALayer *l) {
+    objc_setAssociatedObject(l,&kNativeSlotParent,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static BOOL cpNativePrehide(CALayer *l) {
+    if (!enabled(kReelAudio)||![NSThread isMainThread]||!l) return NO;
+    if (cpNativeRetained(l)||cpNativeLocalConfirmed(l)) {
+        cpNativeRemember(l);
+        cpTransientSet(l,YES);
+        return YES;
+    }
+    // A recycled control that no longer has the same identity or parent
+    // must not retain privacy state from its previous reel.
+    if (objc_getAssociatedObject(l,&kNativeSlotParent)) {
+        cpNativeForget(l);
+        cpTransientSet(l,NO);
+    }
+    return NO;
+}
+static void cpNativePrehideAncestor(CALayer *l) {
+    if (!l||!enabled(kReelAudio)||![NSThread isMainThread]) return;
+    for (NSUInteger i=0;l&&i<8;i++,l=l.superlayer) {
+        if (cpNativeLocalIdentity(l)) {cpNativePrehide(l);return;}
+    }
+}
+static void cpNativeViewLayout(UIView *self,SEL cmd) {
+    ((void(*)(id,SEL))originalNativeLayout)(self,cmd);
+    if (enabled(kReelAudio)) {cpNativePrehide(self.layer);cpTransientSchedule();}
+}
+static void cpNativeViewMove(UIView *self,SEL cmd) {
+    ((void(*)(id,SEL))originalNativeMove)(self,cmd);
+    if (enabled(kReelAudio)) {cpNativePrehide(self.layer);cpTransientSchedule();}
+}
+static void cpNativeViewSuperview(UIView *self,SEL cmd) {
+    ((void(*)(id,SEL))originalNativeSuperview)(self,cmd);
+    if (enabled(kReelAudio)) {cpNativePrehide(self.layer);cpTransientSchedule();}
+}
+static void cpNativeViewBounds(UIView *self,SEL cmd,CGRect r) {
+    ((void(*)(id,SEL,CGRect))originalNativeBounds)(self,cmd,r);
+    if (enabled(kReelAudio)) cpNativePrehide(self.layer);
+}
+static void cpNativeViewFrame(UIView *self,SEL cmd,CGRect r) {
+    ((void(*)(id,SEL,CGRect))originalNativeFrame)(self,cmd,r);
+    if (enabled(kReelAudio)) cpNativePrehide(self.layer);
+}
+
 static void cpTransientScan(void) {
     if (!enabled(kReelAudio)||cpTransientScanning||![NSThread isMainThread]) return;
     if ([UIApplication sharedApplication].applicationState!=UIApplicationStateActive) return;
@@ -1515,16 +1638,16 @@ static void cpTransientScan(void) {
         NSMutableSet<CALayer *> *targets=[NSMutableSet set];
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             if (!w.isKeyWindow||w.hidden||w.alpha<0.01) continue;
-            CALayer *native=cpNativeChoose(w);
-            if (native) {
+            NSArray<CALayer *> *nativeSlots=cpNativeChoose(w);
+            for (CALayer *native in nativeSlots) {
                 CGRect r;
-                if (cpNativeRailRect(native,w,&r)) {
-                    [targets addObject:native];
-                    NSUInteger slotVisits=0;
-                    cpNativeSlotArtwork(w.layer,w,native,r,targets,0,&slotVisits);
-                    continue;
-                }
+                if (!cpNativeRailRect(native,w,&r)) continue;
+                cpNativeRemember(native);
+                [targets addObject:native];
+                NSUInteger slotVisits=0;
+                cpNativeSlotArtwork(w.layer,w,native,r,targets,0,&slotVisits);
             }
+            if (nativeSlots.count) continue;
             NSMutableArray<UIView *> *controls=[NSMutableArray array];
             NSMutableArray<UIView *> *candidates=[NSMutableArray array];
             BOOL reel=NO;NSUInteger visits=0;
@@ -1564,8 +1687,14 @@ static void cpTransientScan(void) {
                 }
             }
         }
-        for (CALayer *l in cpTransientLayers.allObjects)
-            if (![targets containsObject:l]) cpTransientSet(l,NO);
+        for (CALayer *l in cpTransientLayers.allObjects) {
+            if ([targets containsObject:l]) continue;
+            // Do not restore a confirmed native slot just because its reel
+            // is between pages, offscreen or missing from one scan.
+            if (cpNativeRetained(l)) {cpTransientSet(l,YES);continue;}
+            cpNativeForget(l);
+            cpTransientSet(l,NO);
+        }
         for (CALayer *l in targets) cpTransientSet(l,YES);
     } @finally {cpTransientScanning=NO;}
 }
@@ -1578,7 +1707,9 @@ static void cpTransientSchedule(void) {
 }
 static void cpTransientUpdateTimer(void) {
     if (!enabled(kReelAudio)) {
-        [cpTransientTimer invalidate];cpTransientTimer=nil;cpTransientRestore();return;
+        [cpTransientTimer invalidate];cpTransientTimer=nil;
+        for (CALayer *l in cpTransientLayers.allObjects) cpNativeForget(l);
+        cpTransientRestore();return;
     }
     if (!cpTransientTimer) {
         cpTransientTimer=[NSTimer timerWithTimeInterval:0.20 repeats:YES block:^(NSTimer *t) {
@@ -1590,6 +1721,8 @@ static void cpTransientUpdateTimer(void) {
     cpTransientSchedule();
 }
 static void cpTransientLayerHidden(CALayer *self,SEL cmd,BOOL value) {
+    if (!value && [NSThread isMainThread] && enabled(kReelAudio) && !cpTransientScanning)
+        cpNativePrehideAncestor(self);
     NSNumber *prior=objc_getAssociatedObject(self,&kTransientPortrait);
     if (prior&&enabled(kReelAudio)) {
         // Keep the latest app-requested value for clean toggle-off restore.
@@ -1603,15 +1736,20 @@ static void cpTransientLayerContents(CALayer *self,SEL cmd,id value) {
     ((void(*)(id,SEL,id))originalTransientContents)(self,cmd,value);
     if (![NSThread isMainThread]||!enabled(kReelAudio)||cpTransientScanning) return;
     CGSize size=self.bounds.size;
-    if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65)
+    if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65) {
+        cpNativePrehideAncestor(self);
         cpTransientSchedule();
+    }
 }
 static void cpTransientLayerAnimation(CALayer *self,SEL cmd,CAAnimation *animation,NSString *key) {
+    if ([NSThread isMainThread]&&enabled(kReelAudio)&&!cpTransientScanning) {
+        CGSize size=self.bounds.size;
+        if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65) {
+            cpNativePrehideAncestor(self);
+            cpTransientSchedule();
+        }
+    }
     ((void(*)(id,SEL,id,id))originalTransientAnimation)(self,cmd,animation,key);
-    if (![NSThread isMainThread]||!enabled(kReelAudio)||cpTransientScanning) return;
-    CGSize size=self.bounds.size;
-    if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65)
-        cpTransientSchedule();
 }
 
 static void walk(UIView *v, NSUInteger depth) {
@@ -1928,6 +2066,14 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)tableLayout, &originalTableLayout);
             swapMethod([UICollectionViewCell class], @selector(layoutSubviews),
                        (IMP)collectionLayout, &originalCollectionLayout);
+            Class nativeUFI=NSClassFromString(@"IGSundialCommonUISwiftShared.IGSundialUFIButton");
+            if (nativeUFI && [nativeUFI isSubclassOfClass:[UIView class]]) {
+                swapMethod(nativeUFI,@selector(layoutSubviews),(IMP)cpNativeViewLayout,&originalNativeLayout);
+                swapMethod(nativeUFI,@selector(didMoveToWindow),(IMP)cpNativeViewMove,&originalNativeMove);
+                swapMethod(nativeUFI,@selector(didMoveToSuperview),(IMP)cpNativeViewSuperview,&originalNativeSuperview);
+                swapMethod(nativeUFI,@selector(setBounds:),(IMP)cpNativeViewBounds,&originalNativeBounds);
+                swapMethod(nativeUFI,@selector(setFrame:),(IMP)cpNativeViewFrame,&originalNativeFrame);
+            }
             for (UIWindow *w in [UIApplication sharedApplication].windows)
                 cpInstallWindowPrivacyGesture(w);
             cpTransientUpdateTimer();
