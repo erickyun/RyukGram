@@ -14,6 +14,7 @@ static char kGesture, kPriorAlpha, kInlineOriginal, kInlineRendered;
 static IMP originalMove, originalTableLayout, originalCollectionLayout, originalAnyLayout;
 static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
 static IMP originalAudioImage, originalAudioControllerLayout;
+static IMP originalTransientHidden, originalTransientContents, originalTransientAnimation;
 static BOOL changingRenderedText = NO;
 
 static NSString *lower(NSString *s) {
@@ -1243,6 +1244,255 @@ static void cpScheduleReelAudio(UIView *view) {
     });
 }
 
+
+// Delayed original-audio portrait: modern Reels may insert it outside the
+// old overlay subtree and animate its visibility after video playback starts.
+// Confirm a visible Reels viewer in the window, then examine only a small
+// right-rail artwork slot. No video pixels, usernames or network data read.
+static char kTransientPortrait;
+static NSHashTable<CALayer *> *cpTransientLayers;
+static NSTimer *cpTransientTimer;
+static NSString *cpTransientReport;
+static BOOL cpTransientScanning;
+static BOOL cpTransientQueued;
+static CFTimeInterval cpTransientLastScan;
+static BOOL cpTransientVisible(UIView *v, UIWindow *w) {
+    if (!v || v.window!=w) return NO;
+    for (UIView *p=v; p; p=p.superview) {
+        BOOL owned=objc_getAssociatedObject(p.layer,&kTransientPortrait)!=nil;
+        if ((p.hidden&&!owned) || (p.alpha<0.01 && !objc_getAssociatedObject(p,&kAudioAlpha))) return NO;
+        if (p==w) return YES;
+    }
+    return NO;
+}
+static BOOL cpTransientReelEvidence(UIView *v, UIWindow *w) {
+    if (!cpTransientVisible(v,w)) return NO;
+    if (!(cpReelAuthorRoot(v)||cpAudioRoot(v)||cpAudioViewerCell(v))) return NO;
+    CGRect r=[v convertRect:v.bounds toView:w];
+    CGRect screen=w.bounds;
+    if (!CGRectIntersectsRect(r,screen)) return NO;
+    // Require the currently visible cell or the lower author/control area.
+    // Offscreen preloaded cells must not activate the window fallback.
+    return CGRectGetMidY(r)>CGRectGetMinY(screen)+screen.size.height*0.30 &&
+           CGRectGetMidY(r)<CGRectGetMaxY(screen) &&
+           r.size.width>40 && r.size.height>10;
+}
+static BOOL cpTransientSlot(CALayer *l, UIWindow *w, CGRect *outRect) {
+    if (!l.superlayer || !w) return NO;
+    CGRect r=[l convertRect:l.bounds toLayer:w.layer];
+    CGRect b=w.bounds;
+    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
+    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
+    if (!isfinite(x)||!isfinite(y)||x<0.87||x>0.985||y<0.67||y>0.94) return NO;
+    CGFloat a=r.size.width,c=r.size.height;
+    if (a<18||c<18||a>52||c>52||fabs(a-c)>MAX(a,c)*0.28) return NO;
+    if (outRect) *outRect=r;
+    return YES;
+}
+static BOOL cpTransientExcluded(UIView *v) {
+    NSString *n=lower(NSStringFromClass(v.class));
+    return [n containsString:@"comment"]||[n containsString:@"caption"]||
+           [n containsString:@"editor"]||[n containsString:@"capture"]||
+           [n containsString:@"tabbar"]||[n containsString:@"navigationbar"]||
+           [n containsString:@"socialcontext"]||cpReelAuthorRoot(v);
+}
+static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *controls,
+                              NSMutableArray<UIView *> *candidates, NSMutableArray<UIView *> *diagnostic,
+                              BOOL *reel,
+                              NSUInteger depth, NSUInteger *visits) {
+    if (depth>25||(*visits)++>4500||!cpTransientVisible(v,w)) return;
+    if (cpTransientReelEvidence(v,w)) *reel=YES;
+    if (cpTransientExcluded(v)) return;
+    CGRect r;
+    if (cpAudioRailRect(v,&r)) {
+        NSString *n=lower(NSStringFromClass(v.class));
+        BOOL control=[v isKindOfClass:[UIControl class]]||
+                     (v.accessibilityTraits&UIAccessibilityTraitButton)||
+                     [n containsString:@"button"]||cpAudioBookmark(v);
+        // Generic image-backed glyphs also establish the vertical rail.
+        if (control||cpAudioImageView(v)) [controls addObject:v];
+        if (cpTransientSlot(v.layer,w,NULL)&&!cpAudioBookmark(v)) {
+            if (diagnostic.count<32) [diagnostic addObject:v];
+            BOOL rounded=cpAudioRounded(v.layer);
+            BOOL border=v.layer.borderWidth>=0.5;
+            BOOL picture=cpAudioHasPicture(v.layer,0);
+            BOOL image=cpAudioImageView(v);
+            BOOL templateImage=[v isKindOfClass:[UIImageView class]] &&
+                ((UIImageView *)v).image.renderingMode==UIImageRenderingModeAlwaysTemplate;
+            BOOL masked=v.layer.mask!=nil || v.layer.masksToBounds;
+            if (cpAudioNamed(v)||(!templateImage&&
+                ((rounded||border)&&(picture||image||border) ||
+                 (masked&&picture&&image))))
+                [candidates addObject:v];
+        }
+    }
+    for (UIView *c in v.subviews) cpTransientGather(c,w,controls,candidates,diagnostic,reel,depth+1,visits);
+}
+static BOOL cpTransientBelow(CGRect r, NSArray<UIView *> *controls, UIWindow *w) {
+    NSMutableArray<NSNumber *> *rows=[NSMutableArray array];
+    for (UIView *v in controls) {
+        CGRect b;
+        if (!cpAudioRailRect(v,&b)) continue;
+        CGFloat dx=fabs(CGRectGetMidX(r)-CGRectGetMidX(b));
+        CGFloat dy=CGRectGetMidY(r)-CGRectGetMidY(b);
+        if (dx>18||dy<27||dy>330) continue;
+        if (cpAudioBookmark(v)&&dy<=110) return YES;
+        [rows addObject:@(CGRectGetMidY(b))];
+    }
+    CGFloat last=-1000;
+    NSUInteger distinct=0;
+    for (NSNumber *y in [rows sortedArrayUsingSelector:@selector(compare:)]) {
+        if (y.doubleValue-last>25) { distinct++;last=y.doubleValue; }
+    }
+    return distinct>=2 && CGRectGetMidY(r)-last<=110;
+}
+static void cpTransientFindLayers(CALayer *l, UIWindow *w, NSArray<UIView *> *controls,
+                                  NSMutableArray<CALayer *> *matches,
+                                  NSUInteger depth, NSUInteger *visits) {
+    if (depth>29||(*visits)++>6500) return;
+    if (l.hidden&&!objc_getAssociatedObject(l,&kTransientPortrait)) return;
+    id delegate=l.delegate;
+    if ([delegate isKindOfClass:[UIView class]]&&cpTransientExcluded(delegate)) return;
+    CGRect r;
+    if (cpTransientSlot(l,w,&r)&&cpAudioRounded(l)&&l.borderWidth>=0.5&&
+        cpAudioHasPicture(l,0)&&cpTransientBelow(r,controls,w)) [matches addObject:l];
+    for (CALayer *child in l.sublayers) cpTransientFindLayers(child,w,controls,matches,depth+1,visits);
+}
+static void cpTransientSet(CALayer *l, BOOL hide) {
+    NSNumber *prior=objc_getAssociatedObject(l,&kTransientPortrait);
+    if (hide) {
+        if (!cpTransientLayers) cpTransientLayers=[NSHashTable weakObjectsHashTable];
+        [cpTransientLayers addObject:l];
+        if (!prior) objc_setAssociatedObject(l,&kTransientPortrait,@(l.hidden),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (!l.hidden) {
+            [CATransaction begin];[CATransaction setDisableActions:YES];
+            l.hidden=YES;[CATransaction commit];
+        }
+    } else if (prior) {
+        objc_setAssociatedObject(l,&kTransientPortrait,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [cpTransientLayers removeObject:l];
+        [CATransaction begin];[CATransaction setDisableActions:YES];
+        l.hidden=prior.boolValue;[CATransaction commit];
+    }
+}
+static void cpTransientRestore(void) {
+    for (CALayer *l in cpTransientLayers.allObjects) cpTransientSet(l,NO);
+}
+static void cpTransientScan(void) {
+    if (!enabled(kReelAudio)||cpTransientScanning||![NSThread isMainThread]) return;
+    if ([UIApplication sharedApplication].applicationState!=UIApplicationStateActive) return;
+    CFTimeInterval now=CACurrentMediaTime();
+    if (now-cpTransientLastScan<0.055) return;
+    cpTransientLastScan=now;
+    cpTransientScanning=YES;
+    @try {
+        NSMutableSet<CALayer *> *targets=[NSMutableSet set];
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (!w.isKeyWindow||w.hidden||w.alpha<0.01) continue;
+            NSMutableArray<UIView *> *controls=[NSMutableArray array];
+            NSMutableArray<UIView *> *candidates=[NSMutableArray array];
+            NSMutableArray<UIView *> *diagnostic=[NSMutableArray array];
+            BOOL reel=NO;NSUInteger visits=0;
+            cpTransientGather(w,w,controls,candidates,diagnostic,&reel,0,&visits);
+            if (!reel) continue;
+            NSMutableArray<CALayer *> *matches=[NSMutableArray array];
+            for (UIView *v in candidates) {
+                CGRect r;
+                if (!cpTransientSlot(v.layer,w,&r)||!cpTransientBelow(r,controls,w)) continue;
+                [matches addObject:v.layer];
+                UIView *p=v.superview;
+                CGRect b;
+                if (p&&!cpAudioBookmark(p)&&cpTransientSlot(p.layer,w,&b)&&
+                    fabs(CGRectGetMidX(b)-CGRectGetMidX(r))<7&&
+                    fabs(CGRectGetMidY(b)-CGRectGetMidY(r))<7&&
+                    (cpAudioRounded(p.layer)||p.layer.borderWidth>=0.5))
+                    [matches addObject:p.layer];
+            }
+            NSUInteger layerVisits=0;
+            cpTransientFindLayers(w.layer,w,controls,matches,0,&layerVisits);
+            // Choose one artwork position, not all images in the rail.
+            // Include overlapping wrappers at that exact slot, for borders.
+            CALayer *best=nil; CGFloat bestY=-CGFLOAT_MAX;CGRect bestRect=CGRectNull;
+            for (CALayer *l in matches) {
+                CGRect r;
+                if (cpTransientSlot(l,w,&r)&&CGRectGetMidY(r)>bestY) {
+                    best=l;bestY=CGRectGetMidY(r);bestRect=r;
+                }
+            }
+            if (best) {
+                for (CALayer *l in matches) {
+                    CGRect r;
+                    if (cpTransientSlot(l,w,&r)&&
+                        fabs(CGRectGetMidY(r)-CGRectGetMidY(bestRect))<9&&
+                        fabs(CGRectGetMidX(r)-CGRectGetMidX(bestRect))<9)
+                        [targets addObject:l];
+                }
+            }
+            // Keep a sanitized diagnostic: class names, geometry and counts
+            // only. No accessibility text, usernames, images or account data.
+            NSMutableArray<NSString *> *info=[NSMutableArray array];
+            for (UIView *v in diagnostic) {
+                if (info.count>=24) break;
+                CGRect r=[v convertRect:v.bounds toView:w];
+                [info addObject:[NSString stringWithFormat:@"%@ parent=%@ %@ rounded=%d border=%.1f picture=%d masked=%d selected=%d",
+                    NSStringFromClass(v.class),NSStringFromClass(v.superview.class),NSStringFromCGRect(r),
+                    cpAudioRounded(v.layer),v.layer.borderWidth,cpAudioHasPicture(v.layer,0),
+                    v.layer.mask!=nil||v.layer.masksToBounds,[candidates containsObject:v]]];
+            }
+            if (diagnostic.count||!cpTransientReport) cpTransientReport=[NSString stringWithFormat:@"Reels portrait v3: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
+                reel,(unsigned long)controls.count,(unsigned long)candidates.count,
+                (unsigned long)matches.count,[info componentsJoinedByString:@"\n"]];
+        }
+        for (CALayer *l in cpTransientLayers.allObjects)
+            if (![targets containsObject:l]) cpTransientSet(l,NO);
+        for (CALayer *l in targets) cpTransientSet(l,YES);
+    } @finally {cpTransientScanning=NO;}
+}
+static void cpTransientSchedule(void) {
+    if (!enabled(kReelAudio)||cpTransientQueued||cpTransientScanning) return;
+    cpTransientQueued=YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        cpTransientQueued=NO;cpTransientScan();
+    });
+}
+static void cpTransientUpdateTimer(void) {
+    if (!enabled(kReelAudio)) {
+        [cpTransientTimer invalidate];cpTransientTimer=nil;cpTransientRestore();return;
+    }
+    if (!cpTransientTimer) {
+        cpTransientTimer=[NSTimer timerWithTimeInterval:0.20 repeats:YES block:^(NSTimer *t) {
+            if (!enabled(kReelAudio)) {cpTransientUpdateTimer();return;}
+            cpTransientScan();
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:cpTransientTimer forMode:NSRunLoopCommonModes];
+    }
+    cpTransientSchedule();
+}
+static void cpTransientLayerHidden(CALayer *self,SEL cmd,BOOL value) {
+    NSNumber *prior=objc_getAssociatedObject(self,&kTransientPortrait);
+    if (prior&&enabled(kReelAudio)) {
+        // Keep the latest app-requested value for clean toggle-off restore.
+        if (!cpTransientScanning)
+            objc_setAssociatedObject(self,&kTransientPortrait,@(value),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        value=YES;
+    }
+    ((void(*)(id,SEL,BOOL))originalTransientHidden)(self,cmd,value);
+}
+static void cpTransientLayerContents(CALayer *self,SEL cmd,id value) {
+    ((void(*)(id,SEL,id))originalTransientContents)(self,cmd,value);
+    if (![NSThread isMainThread]||!enabled(kReelAudio)||cpTransientScanning) return;
+    CGSize size=self.bounds.size;
+    if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65)
+        cpTransientSchedule();
+}
+static void cpTransientLayerAnimation(CALayer *self,SEL cmd,CAAnimation *animation,NSString *key) {
+    ((void(*)(id,SEL,id,id))originalTransientAnimation)(self,cmd,animation,key);
+    if (![NSThread isMainThread]||!enabled(kReelAudio)||cpTransientScanning) return;
+    CGSize size=self.bounds.size;
+    if (size.width>=16&&size.width<=65&&size.height>=16&&size.height<=65)
+        cpTransientSchedule();
+}
+
 static void walk(UIView *v, NSUInteger depth) {
     if (depth > 25) return;
     if (commentRow(v)) applyRow(v);
@@ -1255,6 +1505,7 @@ static void refresh(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         cpRestoreDisabledCollab();
         cpRestoreDisabledAudio();
+        cpTransientUpdateTimer();
         for (UIWindow *w in [UIApplication sharedApplication].windows) walk(w, 0);
     });
 }
@@ -1266,6 +1517,9 @@ static void refresh(void) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Comment Privacy";
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"Audio Debug" style:UIBarButtonItemStylePlain
+        target:self action:@selector(copyAudioDebug)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithBarButtonSystemItem:UIBarButtonSystemItemDone
         target:self action:@selector(closeMenu)];
@@ -1319,6 +1573,14 @@ static void refresh(void) {
     [[NSUserDefaults standardUserDefaults] setBool:sw.isOn
                                             forKey:sw.accessibilityIdentifier];
     refresh();
+}
+- (void)copyAudioDebug {
+    [UIPasteboard generalPasteboard].string = cpTransientReport ?: @"Reels portrait v3: no visible Reels scan yet";
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Audio diagnostics copied"
+        message:@"Paste this report if the right-hand portrait is still visible. It contains only view classes and geometry."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 @end
@@ -1382,8 +1644,10 @@ static void didMove(UIView *self, SEL cmd) {
     if (!self.window) return;
     attach(self);
     if (enabled(kReelAudio) && (cpAudioRoot(self) || cpAudioNamed(self) ||
-                               cpAudioImageView(self) || cpAudioBookmark(self)))
+                               cpAudioImageView(self) || cpAudioBookmark(self))) {
         cpScheduleReelAudio(self);
+        cpTransientSchedule();
+    }
     BOOL comments = commentRow(self);
     BOOL reelAuthor = cpReelAuthorRoot(self);
     BOOL reelOverlay = cpReelOverlayRoot(self);
@@ -1487,6 +1751,12 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
         if (![name containsString:@"instagram"] && ![identifier containsString:@"instagram"])
             return;
         dispatch_async(dispatch_get_main_queue(), ^{
+            swapMethod([CALayer class], @selector(setHidden:),
+                       (IMP)cpTransientLayerHidden,&originalTransientHidden);
+            swapMethod([CALayer class], @selector(setContents:),
+                       (IMP)cpTransientLayerContents,&originalTransientContents);
+            swapMethod([CALayer class], @selector(addAnimation:forKey:),
+                       (IMP)cpTransientLayerAnimation,&originalTransientAnimation);
             swapMethod([UIView class], @selector(didMoveToWindow),
                        (IMP)didMove, &originalMove);
             swapMethod([UIView class], @selector(layoutSubviews),
@@ -1507,7 +1777,8 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)tableLayout, &originalTableLayout);
             swapMethod([UICollectionViewCell class], @selector(layoutSubviews),
                        (IMP)collectionLayout, &originalCollectionLayout);
-            NSLog(@"[CommentPrivacy] loaded; five independent toggles default OFF");
+            cpTransientUpdateTimer();
+            NSLog(@"[CommentPrivacy] loaded; five independent toggles; transient audio portrait v3");
         });
     }
 }
