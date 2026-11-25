@@ -8,9 +8,11 @@ static NSString *const kNames = @"CPHideCommentUsernames";
 static NSString *const kAvatars = @"CPHideCommentAvatars";
 static NSString *const kReelNames = @"CPHideReelUsernames";
 static NSString *const kReelAvatars = @"CPHideReelProfilePictures";
+static NSString *const kReelAudio = @"CPHideReelAudioThumbnail";
 static char kGesture, kPriorAlpha, kInlineOriginal, kInlineRendered;
 static IMP originalMove, originalTableLayout, originalCollectionLayout, originalAnyLayout;
 static IMP originalSetLabel, originalSetIdentifier, originalLabelText, originalLabelAttributed;
+static IMP originalAudioImage;
 static BOOL changingRenderedText = NO;
 
 static NSString *lower(NSString *s) {
@@ -830,16 +832,252 @@ static void cpRefreshReelFromText(UIView *text) {
     }
 }
 
+
+// Independent toggle for the small audio artwork / Original Audio entry
+// point at the bottom of the RIGHT Reels action rail. Do not hide the
+// left-hand song attribution, change playback, or hide arbitrary images.
+static char kAudioAlpha, kAudioPending, kAudioSelection;
+static NSHashTable<UIView *> *cpAudioHidden;
+static BOOL cpAudioRoot(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    if (commentRow(v) || [n containsString:@"comment"] ||
+        [n containsString:@"editor"] || [n containsString:@"creation"] ||
+        [n containsString:@"capture"] || [n containsString:@"preview"]) return NO;
+    if (cpReelOverlayRoot(v)) return YES;
+    BOOL reel = [n containsString:@"sundial"] || [n containsString:@"reels"] ||
+                [n containsString:@"clipsviewer"];
+    BOOL controls = [n containsString:@"ufi"] || [n containsString:@"actionrail"] ||
+                    [n containsString:@"actionbar"] || [n containsString:@"interactionbar"] ||
+                    [n containsString:@"rightcontrols"] || [n containsString:@"controlsoverlay"];
+    return reel && controls;
+}
+// Select a single outer control scope rather than independently hiding
+// different images in both a nested UFI view and its parent overlay.
+static UIView *cpAudioScope(UIView *view) {
+    UIView *root = nil;
+    for (UIView *v = view; v && v != view.window; v = v.superview) {
+        NSString *n = lower(NSStringFromClass(v.class));
+        if ([n containsString:@"comment"] || [n containsString:@"editor"] ||
+            [n containsString:@"capture"] || [n containsString:@"creation"]) break;
+        if (cpAudioRoot(v)) root = v;
+        if (cpReelOverlayRoot(v)) break;
+    }
+    return root;
+}
+static BOOL cpAudioNamed(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    NSString *ident = lower(v.accessibilityIdentifier);
+    NSString *label = lower(v.accessibilityLabel);
+    NSString *s = [NSString stringWithFormat:@"%@ %@ %@",n,ident,label];
+    for (NSString *bad in @[@"mute", @"volume", @"playback", @"playbutton",
+                              @"pausebutton", @"savebutton", @"bookmark",
+                              @"likebutton", @"commentbutton", @"sharebutton"])
+        if ([s containsString:bad]) return NO;
+    BOOL audio = [s containsString:@"audio"] || [s containsString:@"music"] ||
+                 [s containsString:@"sound"] || [s containsString:@"albumart"];
+    BOOL image = [s containsString:@"thumbnail"] || [s containsString:@"artwork"] ||
+                 [s containsString:@"cover"] || [s containsString:@"album"] ||
+                 [s containsString:@"attribution"] || [s containsString:@"button"] ||
+                 [s containsString:@"entrypoint"] || [s containsString:@"pivot"];
+    return (audio && image) || [label hasPrefix:@"original audio"] ||
+           [label hasPrefix:@"original sound"] || [label hasPrefix:@"orijinal ses"] ||
+           [label hasPrefix:@"view audio"] || [label hasPrefix:@"audio page"];
+}
+static BOOL cpAudioImageView(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    return [v isKindOfClass:[UIImageView class]] || [n containsString:@"imageview"] ||
+           [n containsString:@"artworkview"] || [n containsString:@"thumbnailview"];
+}
+static BOOL cpAudioBookmark(UIView *v) {
+    NSString *n = lower(NSStringFromClass(v.class));
+    NSString *i = lower(v.accessibilityIdentifier);
+    NSString *l = lower(v.accessibilityLabel);
+    return [n containsString:@"bookmark"] || [n containsString:@"savebutton"] ||
+           [i containsString:@"bookmark"] || [i containsString:@"savebutton"] ||
+           [i isEqualToString:@"save"] || [l isEqualToString:@"save"] ||
+           [l isEqualToString:@"saved"] || [l isEqualToString:@"unsave"] ||
+           [l hasPrefix:@"save reel"] || [l hasPrefix:@"remove from saved"] ||
+           [l isEqualToString:@"kaydet"] || [l isEqualToString:@"kaydedildi"];
+}
+static BOOL cpAudioRailRect(UIView *v, CGRect *outRect) {
+    UIWindow *w = v.window;
+    if (!w || !v.superview) return NO;
+    CGRect r = [v convertRect:v.bounds toView:w];
+    CGRect bounds = w.bounds;
+    CGFloat width = r.size.width, height = r.size.height;
+    if (width < 15 || height < 15 || width > 64 || height > 64 ||
+        fabs(width-height) > MAX(width,height)*0.46) return NO;
+    if (CGRectGetMidX(r) < CGRectGetMinX(bounds)+bounds.size.width*0.80 ||
+        CGRectGetMidY(r) < CGRectGetMinY(bounds)+bounds.size.height*0.42 ||
+        CGRectGetMidY(r) > CGRectGetMinY(bounds)+bounds.size.height*0.97)
+        return NO;
+    if (outRect) *outRect = r;
+    return YES;
+}
+static UIView *cpAudioGetterView(UIView *parent, NSString *key) {
+    SEL sel = NSSelectorFromString(key);
+    NSMethodSignature *signature = [parent methodSignatureForSelector:sel];
+    if (!signature || signature.numberOfArguments != 2 ||
+        signature.methodReturnType[0] != '@') return nil;
+    return cpReelSubView(parent,key);
+}
+static void cpAudioCollect(UIView *v, UIView *root,
+                           NSMutableOrderedSet<UIView *> *named,
+                           NSMutableOrderedSet<UIView *> *images,
+                           NSMutableOrderedSet<UIView *> *bookmarks,
+                           NSUInteger depth, NSUInteger *visited) {
+    if (depth > 13 || *visited >= 600) return;
+    (*visited)++;
+    if (v != root) {
+        NSString *n = lower(NSStringFromClass(v.class));
+        if (cpReelAuthorRoot(v) || [n containsString:@"comment"] ||
+            [n containsString:@"caption"] || [n containsString:@"socialcontext"])
+            return;
+        if (cpAudioRailRect(v,NULL)) {
+            if (cpAudioNamed(v)) [named addObject:v];
+            if (cpAudioImageView(v)) [images addObject:v];
+            if (cpAudioBookmark(v)) [bookmarks addObject:v];
+        }
+    }
+    if (v == root || cpAudioRoot(v)) {
+        for (NSString *key in @[@"audioThumbnailButton", @"audioThumbnailView",
+                                  @"audioThumbnailImageView", @"audioCoverButton",
+                                  @"audioCoverView", @"audioArtworkView",
+                                  @"albumArtView", @"musicThumbnailView",
+                                  @"audioPageButton", @"audioPivotButton",
+                                  @"audioAttributionButton", @"audioAttributionView",
+                                  @"audioAttribution", @"audioButton", @"musicButton",
+                                  @"musicAttributionView", @"audioEntryPoint"]) {
+            UIView *candidate = cpAudioGetterView(v,key);
+            if (candidate && candidate != root && cpAudioRailRect(candidate,NULL))
+                [named addObject:candidate];
+        }
+        for (NSString *key in @[@"saveButton", @"bookmarkButton",
+                                  @"saveControl", @"bookmarkControl"]) {
+            UIView *candidate = cpAudioGetterView(v,key);
+            if (candidate && cpAudioRailRect(candidate,NULL)) [bookmarks addObject:candidate];
+        }
+    }
+    for (UIView *child in v.subviews)
+        cpAudioCollect(child,root,named,images,bookmarks,depth+1,visited);
+}
+static void cpAudioAlpha(UIView *v, BOOL hide) {
+    if (!v) return;
+    NSNumber *prior = objc_getAssociatedObject(v,&kAudioAlpha);
+    if (hide) {
+        if (!cpAudioHidden) cpAudioHidden = [NSHashTable weakObjectsHashTable];
+        [cpAudioHidden addObject:v];
+        if (!prior) objc_setAssociatedObject(v,&kAudioAlpha,@(v.alpha),OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (v.alpha != 0) v.alpha = 0;
+    } else {
+        if (prior) {
+            objc_setAssociatedObject(v,&kAudioAlpha,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            v.alpha = prior.doubleValue;
+        }
+        [cpAudioHidden removeObject:v];
+    }
+}
+static void cpRestoreDisabledAudio(void) {
+    if (enabled(kReelAudio)) return;
+    for (UIView *v in cpAudioHidden.allObjects) cpAudioAlpha(v,NO);
+}
+// If the actual image lives in a small audio button, hide the entire
+// button (including its outline), not the rest of the vertical action bar.
+static UIView *cpAudioPromote(UIView *v, UIView *root) {
+    UIView *p = v.superview;
+    if (!p || p == root || cpAudioBookmark(p)) return v;
+    CGRect a,b;
+    if (!cpAudioRailRect(v,&a) || !cpAudioRailRect(p,&b)) return v;
+    BOOL control = [p isKindOfClass:[UIControl class]] ||
+                   (p.accessibilityTraits & UIAccessibilityTraitButton) ||
+                   [lower(NSStringFromClass(p.class)) containsString:@"button"];
+    if ((cpAudioNamed(p) || control) &&
+        b.size.width <= a.size.width+20 && b.size.height <= a.size.height+20 &&
+        fabs(CGRectGetMidX(a)-CGRectGetMidX(b)) <= 8 &&
+        fabs(CGRectGetMidY(a)-CGRectGetMidY(b)) <= 8) return p;
+    return v;
+}
+static void cpApplyReelAudio(UIView *root) {
+    if (!root.window || !enabled(kReelAudio) || cpAudioScope(root) != root) return;
+    NSMutableOrderedSet<UIView *> *named = [NSMutableOrderedSet orderedSet];
+    NSMutableOrderedSet<UIView *> *images = [NSMutableOrderedSet orderedSet];
+    NSMutableOrderedSet<UIView *> *bookmarks = [NSMutableOrderedSet orderedSet];
+    NSUInteger visited=0;
+    cpAudioCollect(root,root,named,images,bookmarks,0,&visited);
+    UIView *chosen=nil;
+    CGFloat best=-CGFLOAT_MAX;
+    // The named or typed audio control is the most reliable candidate.
+    for (UIView *v in named) {
+        CGRect r;
+        if (!cpAudioRailRect(v,&r) || cpAudioBookmark(v)) continue;
+        CGFloat score=CGRectGetMidY(r);
+        if (score>best) {best=score;chosen=v;}
+    }
+    // For modern generic artwork views, require the Save/Bookmark anchor
+    // immediately above on the same right-hand rail. No global image scan.
+    if (!chosen) {
+        for (UIView *v in images) {
+            CGRect r;
+            if (!cpAudioRailRect(v,&r) || cpAudioBookmark(v)) continue;
+            // A template UIImage is a glyph rather than actual cover art.
+            if ([v isKindOfClass:[UIImageView class]]) {
+                UIImage *image=((UIImageView *)v).image;
+                if (image && image.renderingMode==UIImageRenderingModeAlwaysTemplate) continue;
+            }
+            for (UIView *save in bookmarks) {
+                CGRect b;
+                if (save==v || [v isDescendantOfView:save] ||
+                    !cpAudioRailRect(save,&b)) continue;
+                CGFloat dy=CGRectGetMidY(r)-CGRectGetMidY(b);
+                CGFloat dx=fabs(CGRectGetMidX(r)-CGRectGetMidX(b));
+                if (dx>22 || dy<MAX(22.0,b.size.height*0.6) || dy>120) continue;
+                CGFloat score=CGRectGetMidY(r)-dx*2;
+                if (score>best) {best=score;chosen=v;}
+            }
+        }
+    }
+    if (chosen) chosen=cpAudioPromote(chosen,root);
+    // Restore the old selection when a recycled reel changes its artwork
+    // or when this layout no longer identifies the audio entry point.
+    NSHashTable<UIView *> *previous=objc_getAssociatedObject(root,&kAudioSelection);
+    for (UIView *old in previous.allObjects)
+        if (old != chosen) cpAudioAlpha(old,NO);
+    if (!previous) {
+        previous=[NSHashTable weakObjectsHashTable];
+        objc_setAssociatedObject(root,&kAudioSelection,previous,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [previous removeAllObjects];
+    if (chosen) {
+        [previous addObject:chosen];
+        cpAudioAlpha(chosen,YES);
+    }
+}
+static void cpScheduleReelAudio(UIView *view) {
+    if (!enabled(kReelAudio) || !view.window) return;
+    UIView *root=cpAudioScope(view);
+    if (!root || objc_getAssociatedObject(root,&kAudioPending)) return;
+    objc_setAssociatedObject(root,&kAudioPending,@YES,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UIView *weakRoot=root;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *strongRoot=weakRoot;
+        if (!strongRoot) return;
+        objc_setAssociatedObject(strongRoot,&kAudioPending,nil,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cpApplyReelAudio(strongRoot);
+    });
+}
+
 static void walk(UIView *v, NSUInteger depth) {
     if (depth > 25) return;
     if (commentRow(v)) applyRow(v);
     if (cpReelAuthorRoot(v)) cpApplyReelAuthor(v);
     if (cpReelOverlayRoot(v)) cpApplyReelOverlay(v);
+    if (enabled(kReelAudio) && cpAudioRoot(v)) cpApplyReelAudio(v);
     for (UIView *c in v.subviews) walk(c, depth + 1);
 }
 static void refresh(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         cpRestoreDisabledCollab();
+        cpRestoreDisabledAudio();
         for (UIWindow *w in [UIApplication sharedApplication].windows) walk(w, 0);
     });
 }
@@ -856,7 +1094,7 @@ static void refresh(void) {
         target:self action:@selector(closeMenu)];
     self.tableView.rowHeight = 61;
     UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(16, 0, 270, 70)];
-    footer.text = @"Comment options affect post and Reels comments. Reels options affect the video author's username and profile picture only.";
+    footer.text = @"Reels options hide the author's name, profile picture and right-hand audio thumbnail independently. Audio playback is unchanged.";
     footer.textColor = [UIColor secondaryLabelColor];
     footer.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     footer.textAlignment = NSTextAlignmentCenter;
@@ -867,7 +1105,7 @@ static void refresh(void) {
     return 2;
 }
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return 2;
+    return section == 0 ? 2 : 3;
 }
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     return section == 0 ? @"Comments" : @"Reels";
@@ -882,6 +1120,9 @@ static void refresh(void) {
     if (indexPath.section == 0) {
         key = indexPath.row == 0 ? kNames : kAvatars;
         title = indexPath.row == 0 ? @"Hide Comment Usernames" : @"Hide Comment Avatars";
+    } else if (indexPath.row == 2) {
+        key = kReelAudio;
+        title = @"Hide Reels Audio Thumbnail";
     } else {
         key = indexPath.row == 0 ? kReelNames : kReelAvatars;
         title = indexPath.row == 0 ? @"Hide Reels Usernames" : @"Hide Reels Profile Pictures";
@@ -959,8 +1200,13 @@ static void attach(UIView *v) {
 }
 static void didMove(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalMove)(self, cmd);
+    if (objc_getAssociatedObject(self,&kAudioAlpha) &&
+        (!self.window || !cpAudioScope(self) || !enabled(kReelAudio))) cpAudioAlpha(self,NO);
     if (!self.window) return;
     attach(self);
+    if (enabled(kReelAudio) && (cpAudioRoot(self) || cpAudioNamed(self) ||
+                               cpAudioImageView(self) || cpAudioBookmark(self)))
+        cpScheduleReelAudio(self);
     BOOL comments = commentRow(self);
     BOOL reelAuthor = cpReelAuthorRoot(self);
     BOOL reelOverlay = cpReelOverlayRoot(self);
@@ -977,11 +1223,19 @@ static void didMove(UIView *self, SEL cmd) {
 }
 static void setLabel(UIView *self, SEL cmd, NSString *label) {
     ((void (*)(id, SEL, id))originalSetLabel)(self, cmd, label);
-    if (self.window) attach(self);
+    if (self.window) {
+        attach(self);
+        if (enabled(kReelAudio) && (cpAudioNamed(self) || cpAudioBookmark(self)))
+            cpScheduleReelAudio(self);
+    }
 }
 static void setIdentifier(UIView *self, SEL cmd, NSString *value) {
     ((void (*)(id, SEL, id))originalSetIdentifier)(self, cmd, value);
-    if (self.window) attach(self);
+    if (self.window) {
+        attach(self);
+        if (enabled(kReelAudio) && (cpAudioNamed(self) || cpAudioBookmark(self)))
+            cpScheduleReelAudio(self);
+    }
 }
 static void genericLayout(UIView *self, SEL cmd) {
     ((void (*)(id, SEL))originalAnyLayout)(self, cmd);
@@ -989,6 +1243,16 @@ static void genericLayout(UIView *self, SEL cmd) {
     if (commentRow(self)) applyRow(self);
     if (cpReelAuthorRoot(self)) cpApplyReelAuthor(self);
     if (cpReelOverlayRoot(self)) cpApplyReelOverlay(self);
+    if (enabled(kReelAudio)) {
+        if (cpAudioRoot(self)) cpApplyReelAudio(self);
+        else if (objc_getAssociatedObject(self,&kAudioAlpha) || cpAudioNamed(self))
+            cpScheduleReelAudio(self);
+    }
+}
+static void audioImage(UIImageView *self, SEL cmd, UIImage *image) {
+    ((void (*)(id, SEL, id))originalAudioImage)(self,cmd,image);
+    if (enabled(kReelAudio) && [NSThread isMainThread] && cpAudioRailRect(self,NULL))
+        cpScheduleReelAudio(self);
 }
 static void refreshFromLabel(UILabel *label) {
     if (changingRenderedText || !label.window) return;
@@ -1044,6 +1308,8 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)didMove, &originalMove);
             swapMethod([UIView class], @selector(layoutSubviews),
                        (IMP)genericLayout, &originalAnyLayout);
+            swapMethod([UIImageView class], @selector(setImage:),
+                       (IMP)audioImage, &originalAudioImage);
             swapMethod([UILabel class], @selector(setText:),
                        (IMP)labelText, &originalLabelText);
             swapMethod([UILabel class], @selector(setAttributedText:),
@@ -1056,7 +1322,7 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
                        (IMP)tableLayout, &originalTableLayout);
             swapMethod([UICollectionViewCell class], @selector(layoutSubviews),
                        (IMP)collectionLayout, &originalCollectionLayout);
-            NSLog(@"[CommentPrivacy] loaded; four independent toggles default OFF");
+            NSLog(@"[CommentPrivacy] loaded; five independent toggles default OFF");
         });
     }
 }
