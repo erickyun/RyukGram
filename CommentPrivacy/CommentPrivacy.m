@@ -1675,8 +1675,8 @@ static UIViewController *topController(void) {
         ([top isKindOfClass:[UINavigationController class]] &&
          [[(UINavigationController *)top topViewController] isKindOfClass:[CPMenu class]]))
         return;
-    if (press.numberOfTouchesRequired==2 || cpAudioScope(press.view))
-        cpCaptureManualRail(press.view.window ?: (UIWindow *)([press.view isKindOfClass:[UIWindow class]]?press.view:nil));
+    if (press.numberOfTouchesRequired==2 || cpAudioScope(press.view) || cpAudioScope(press.view.superview))
+        cpCaptureManualRail(press.view.window ?: ([press.view isKindOfClass:[UIWindow class]] ? (UIWindow *)press.view : nil));
     UINavigationController *nav = [[UINavigationController alloc]
         initWithRootViewController:[[CPMenu alloc] init]];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -1695,7 +1695,7 @@ static void cpAttachCommentControl(UIView *v, BOOL confirmed) {
 }
 static void attach(UIView *v) {
     cpAttachCommentControl(v,NO);
-    if (!v.window || !cpAudioScope(v)) return;
+    if (!v.window || (!cpAudioScope(v) && !cpAudioScope(v.superview))) return;
     // Native Reels UFI can use a generic control with no button title.
     if (cpAudioRoot(v)) {
         for (NSString *key in @[@"commentButton",@"commentsButton",@"commentControl",
