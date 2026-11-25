@@ -1255,10 +1255,12 @@ static NSTimer *cpTransientTimer;
 static NSString *cpTransientReport;
 static BOOL cpTransientScanning;
 static BOOL cpTransientQueued;
+static CFTimeInterval cpTransientLastScan;
 static BOOL cpTransientVisible(UIView *v, UIWindow *w) {
     if (!v || v.window!=w) return NO;
     for (UIView *p=v; p; p=p.superview) {
-        if (p.hidden || (p.alpha<0.01 && !objc_getAssociatedObject(p,&kAudioAlpha))) return NO;
+        BOOL owned=objc_getAssociatedObject(p.layer,&kTransientPortrait)!=nil;
+        if ((p.hidden&&!owned) || (p.alpha<0.01 && !objc_getAssociatedObject(p,&kAudioAlpha))) return NO;
         if (p==w) return YES;
     }
     return NO;
@@ -1295,7 +1297,8 @@ static BOOL cpTransientExcluded(UIView *v) {
            [n containsString:@"socialcontext"]||cpReelAuthorRoot(v);
 }
 static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *controls,
-                              NSMutableArray<UIView *> *candidates, BOOL *reel,
+                              NSMutableArray<UIView *> *candidates, NSMutableArray<UIView *> *diagnostic,
+                              BOOL *reel,
                               NSUInteger depth, NSUInteger *visits) {
     if (depth>25||(*visits)++>4500||!cpTransientVisible(v,w)) return;
     if (cpTransientReelEvidence(v,w)) *reel=YES;
@@ -1309,18 +1312,21 @@ static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *
         // Generic image-backed glyphs also establish the vertical rail.
         if (control||cpAudioImageView(v)) [controls addObject:v];
         if (cpTransientSlot(v.layer,w,NULL)&&!cpAudioBookmark(v)) {
+            if (diagnostic.count<32) [diagnostic addObject:v];
             BOOL rounded=cpAudioRounded(v.layer);
             BOOL border=v.layer.borderWidth>=0.5;
             BOOL picture=cpAudioHasPicture(v.layer,0);
             BOOL image=cpAudioImageView(v);
             BOOL templateImage=[v isKindOfClass:[UIImageView class]] &&
                 ((UIImageView *)v).image.renderingMode==UIImageRenderingModeAlwaysTemplate;
+            BOOL masked=v.layer.mask!=nil || v.layer.masksToBounds;
             if (cpAudioNamed(v)||(!templateImage&&
-                ((rounded||border)&&(picture||image||border))))
+                ((rounded||border)&&(picture||image||border) ||
+                 (masked&&picture&&image))))
                 [candidates addObject:v];
         }
     }
-    for (UIView *c in v.subviews) cpTransientGather(c,w,controls,candidates,reel,depth+1,visits);
+    for (UIView *c in v.subviews) cpTransientGather(c,w,controls,candidates,diagnostic,reel,depth+1,visits);
 }
 static BOOL cpTransientBelow(CGRect r, NSArray<UIView *> *controls, UIWindow *w) {
     NSMutableArray<NSNumber *> *rows=[NSMutableArray array];
@@ -1375,6 +1381,9 @@ static void cpTransientRestore(void) {
 static void cpTransientScan(void) {
     if (!enabled(kReelAudio)||cpTransientScanning||![NSThread isMainThread]) return;
     if ([UIApplication sharedApplication].applicationState!=UIApplicationStateActive) return;
+    CFTimeInterval now=CACurrentMediaTime();
+    if (now-cpTransientLastScan<0.055) return;
+    cpTransientLastScan=now;
     cpTransientScanning=YES;
     @try {
         NSMutableSet<CALayer *> *targets=[NSMutableSet set];
@@ -1382,8 +1391,9 @@ static void cpTransientScan(void) {
             if (!w.isKeyWindow||w.hidden||w.alpha<0.01) continue;
             NSMutableArray<UIView *> *controls=[NSMutableArray array];
             NSMutableArray<UIView *> *candidates=[NSMutableArray array];
+            NSMutableArray<UIView *> *diagnostic=[NSMutableArray array];
             BOOL reel=NO;NSUInteger visits=0;
-            cpTransientGather(w,w,controls,candidates,&reel,0,&visits);
+            cpTransientGather(w,w,controls,candidates,diagnostic,&reel,0,&visits);
             if (!reel) continue;
             NSMutableArray<CALayer *> *matches=[NSMutableArray array];
             for (UIView *v in candidates) {
@@ -1421,13 +1431,15 @@ static void cpTransientScan(void) {
             // Keep a sanitized diagnostic: class names, geometry and counts
             // only. No accessibility text, usernames, images or account data.
             NSMutableArray<NSString *> *info=[NSMutableArray array];
-            for (UIView *v in candidates) {
-                if (info.count>=12) break;
+            for (UIView *v in diagnostic) {
+                if (info.count>=24) break;
                 CGRect r=[v convertRect:v.bounds toView:w];
-                [info addObject:[NSString stringWithFormat:@"%@ %@ rounded=%d border=%.1f",
-                    NSStringFromClass(v.class),NSStringFromCGRect(r),cpAudioRounded(v.layer),v.layer.borderWidth]];
+                [info addObject:[NSString stringWithFormat:@"%@ parent=%@ %@ rounded=%d border=%.1f picture=%d masked=%d selected=%d",
+                    NSStringFromClass(v.class),NSStringFromClass(v.superview.class),NSStringFromCGRect(r),
+                    cpAudioRounded(v.layer),v.layer.borderWidth,cpAudioHasPicture(v.layer,0),
+                    v.layer.mask!=nil||v.layer.masksToBounds,[candidates containsObject:v]]];
             }
-            cpTransientReport=[NSString stringWithFormat:@"Reels portrait v3: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
+            if (diagnostic.count||!cpTransientReport) cpTransientReport=[NSString stringWithFormat:@"Reels portrait v3: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
                 reel,(unsigned long)controls.count,(unsigned long)candidates.count,
                 (unsigned long)matches.count,[info componentsJoinedByString:@"\n"]];
         }
