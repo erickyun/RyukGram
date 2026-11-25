@@ -1041,7 +1041,7 @@ static void cpApplyReelAudio(UIView *root) {
     // or when this layout no longer identifies the audio entry point.
     NSHashTable<UIView *> *previous=objc_getAssociatedObject(root,&kAudioSelection);
     for (UIView *old in previous.allObjects)
-        if (old!=chosen && ![chosen isDescendantOfView:old]) cpAudioAlpha(old,NO);
+        if (old != chosen) cpAudioAlpha(old,NO);
     if (!previous) {
         previous=[NSHashTable weakObjectsHashTable];
         objc_setAssociatedObject(root,&kAudioSelection,previous,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
