@@ -1257,7 +1257,7 @@ static BOOL cpTransientScanning;
 static BOOL cpTransientQueued;
 static CFTimeInterval cpTransientLastScan;
 static BOOL cpTransientVisible(UIView *v, UIWindow *w) {
-    if (!v || v.window!=w) return NO;
+    if (!v || !w || (v!=w && v.window!=w)) return NO;
     for (UIView *p=v; p; p=p.superview) {
         BOOL owned=objc_getAssociatedObject(p.layer,&kTransientPortrait)!=nil;
         if ((p.hidden&&!owned) || (p.alpha<0.01 && !objc_getAssociatedObject(p,&kAudioAlpha))) return NO;
@@ -1378,6 +1378,136 @@ static void cpTransientSet(CALayer *l, BOOL hide) {
 static void cpTransientRestore(void) {
     for (CALayer *l in cpTransientLayers.allObjects) cpTransientSet(l,NO);
 }
+
+// Instagram 456 device report (440x956 pt):
+// Counted UFI rows: (387.5,657,44,70), (387.5,730,44,70).
+// Terminal Swift UFI: (389.5,798,40,48), same horizontal center.
+// This terminal control remains present even when its picture is replaced
+// by a 24pt glyph. Hide the SLOT, not only a rounded image after loading.
+// Treat the class/geometry as a device-derived hypothesis; do not hide
+// another UFI control solely because it shares the same Swift class.
+static BOOL cpNativeRailRect(CALayer *l, UIWindow *w, CGRect *out) {
+    CGRect r=[l convertRect:l.bounds toLayer:w.layer];
+    CGRect b=w.bounds;
+    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
+    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
+    if (!isfinite(x)||!isfinite(y)||x<0.84||x>0.985||y<0.40||y>0.94||
+        r.size.width<12||r.size.width>90||r.size.height<12||r.size.height>125)
+        return NO;
+    if (out) *out=r;
+    return YES;
+}
+static NSString *cpNativeOwner(CALayer *l) {
+    id d=l.delegate;
+    return d?NSStringFromClass([d class]):@"";
+}
+static BOOL cpNativeCounted(CALayer *l) {
+    return [cpNativeOwner(l) hasSuffix:@"IGSundialUFIButtonWithCount"];
+}
+static BOOL cpNativeTerminal(CALayer *l, UIWindow *w) {
+    NSString *n=cpNativeOwner(l);
+    if (![n hasSuffix:@".IGSundialUFIButton"] &&
+        ![n isEqualToString:@"IGSundialUFIButton"]) return NO;
+    CGRect r;
+    if (!cpNativeRailRect(l,w,&r)) return NO;
+    CGFloat a=r.size.width,h=r.size.height;
+    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(w.bounds))/w.bounds.size.height;
+    if (a<34||a>48||h<43||h>58||h-a<5||h-a>16||y<0.70||y>0.92) return NO;
+    id d=l.delegate;
+    // Never hide a control that explicitly identifies itself as Save or
+    // another interaction. Some Swift wrappers have no accessibility label.
+    if ([d isKindOfClass:[UIView class]]) {
+        UIView *v=d;
+        if (cpAudioBookmark(v)) return NO;
+        NSString *label=lower(v.accessibilityLabel);
+        NSString *ident=lower(v.accessibilityIdentifier);
+        for (NSString *bad in @[@"like",@"comment",@"share",@"repost",@"send",@"more options",@"bookmark",@"save",@"beğen",@"yorum",@"paylaş",@"kaydet"])
+            if ([label hasPrefix:bad]||[ident hasPrefix:bad]) return NO;
+    }
+    return YES;
+}
+static void cpNativeCollect(CALayer *l, UIWindow *w, NSMutableArray<CALayer *> *counted,
+                            NSMutableArray<CALayer *> *terminal, NSUInteger depth, NSUInteger *visits) {
+    if (depth>32||(*visits)++>9000) return;
+    if (l.hidden&&!objc_getAssociatedObject(l,&kTransientPortrait)) return;
+    if (l.opacity<0.01&&!objc_getAssociatedObject(l,&kTransientPortrait)) return;
+    CGRect r;
+    if (cpNativeRailRect(l,w,&r)) {
+        if (cpNativeCounted(l)&&r.size.width>=30&&r.size.width<=60&&
+            r.size.height>=50&&r.size.height<=90) [counted addObject:l];
+        if (cpNativeTerminal(l,w)) [terminal addObject:l];
+    }
+    for (CALayer *child in l.sublayers) cpNativeCollect(child,w,counted,terminal,depth+1,visits);
+}
+static CALayer *cpNativeCommonRail(CALayer *a,CALayer *b,UIWindow *w) {
+    for (CALayer *p=a.superlayer;p&&p!=w.layer;p=p.superlayer) {
+        for (CALayer *q=b.superlayer;q&&q!=w.layer;q=q.superlayer) {
+            if (q!=p) continue;
+            CGRect r=[p convertRect:p.bounds toLayer:w.layer];
+            if (r.size.width<=180&&r.size.height<=w.bounds.size.height) return p;
+        }
+    }
+    return nil;
+}
+static CALayer *cpNativeChoose(UIWindow *w, NSUInteger *countedCount, NSUInteger *terminalCount) {
+    NSMutableArray<CALayer *> *counted=[NSMutableArray array],*terminal=[NSMutableArray array];
+    NSUInteger visits=0;
+    cpNativeCollect(w.layer,w,counted,terminal,0,&visits);
+    if (countedCount) *countedCount=counted.count;
+    if (terminalCount) *terminalCount=terminal.count;
+    CALayer *best=nil;CGFloat bestY=-CGFLOAT_MAX;
+    for (CALayer *candidate in terminal) {
+        CGRect r; if (!cpNativeRailRect(candidate,w,&r)) continue;
+        NSMutableArray<NSNumber *> *ys=[NSMutableArray array];
+        BOOL near=NO;
+        for (CALayer *row in counted) {
+            CGRect b; if (!cpNativeRailRect(row,w,&b)) continue;
+            CGFloat dy=CGRectGetMidY(r)-CGRectGetMidY(b);
+            if (fabs(CGRectGetMidX(r)-CGRectGetMidX(b))>12||dy<28||dy>230) continue;
+            // Matching classes and same column are already strong evidence.
+            // Prefer shared rail ancestry; allow exact aligned adjacent rows
+            // even when Swift hosts each button separately.
+            CGFloat gap=CGRectGetMinY(r)-CGRectGetMaxY(b);
+            if (gap>=-8&&gap<=32&&(cpNativeCommonRail(candidate,row,w)||
+                fabs(CGRectGetMidX(r)-CGRectGetMidX(b))<=3)) near=YES;
+            [ys addObject:@(CGRectGetMidY(b))];
+        }
+        NSUInteger distinct=0;CGFloat last=-1000;
+        for (NSNumber *y in [ys sortedArrayUsingSelector:@selector(compare:)]) {
+            if (y.doubleValue-last>30) {distinct++;last=y.doubleValue;}
+        }
+        if (near&&distinct>=2&&CGRectGetMidY(r)>bestY) {best=candidate;bestY=CGRectGetMidY(r);}
+    }
+    return best;
+}
+static BOOL cpNativeDescendant(CALayer *layer,CALayer *ancestor) {
+    for (CALayer *p=layer;p;p=p.superlayer) if (p==ancestor) return YES;
+    return NO;
+}
+// An animated portrait may be attached as a sibling instead of a child of
+// the terminal control. Only take a compact artwork layer in that same slot.
+static void cpNativeSlotArtwork(CALayer *l, UIWindow *w, CALayer *button, CGRect slot,
+                                NSMutableSet<CALayer *> *targets, NSUInteger depth, NSUInteger *visits) {
+    if (depth>30||(*visits)++>8500||cpNativeDescendant(l,button)) return;
+    if (l.hidden&&!objc_getAssociatedObject(l,&kTransientPortrait)) return;
+    NSString *owner=cpNativeOwner(l);
+    if ([owner containsString:@"TabBar"]||[owner containsString:@"Comment"]||
+        [owner containsString:@"Caption"]) return;
+    CGRect r;
+    if (cpNativeRailRect(l,w,&r)&&r.size.width>=18&&r.size.width<=62&&
+        r.size.height>=18&&r.size.height<=62&&
+        fabs(CGRectGetMidX(r)-CGRectGetMidX(slot))<=10&&
+        fabs(CGRectGetMidY(r)-CGRectGetMidY(slot))<=13&&
+        !cpNativeDescendant(button,l)&&
+        ![owner containsString:@"Label"]&&
+        (cpAudioRounded(l)||l.borderWidth>=0.5||l.mask!=nil)&&
+        (cpAudioHasPicture(l,0)||l.borderWidth>=0.5)) {
+        [targets addObject:l];
+        return;
+    }
+    for (CALayer *child in l.sublayers) cpNativeSlotArtwork(child,w,button,slot,targets,depth+1,visits);
+}
+
 static void cpTransientScan(void) {
     if (!enabled(kReelAudio)||cpTransientScanning||![NSThread isMainThread]) return;
     if ([UIApplication sharedApplication].applicationState!=UIApplicationStateActive) return;
@@ -1389,12 +1519,32 @@ static void cpTransientScan(void) {
         NSMutableSet<CALayer *> *targets=[NSMutableSet set];
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             if (!w.isKeyWindow||w.hidden||w.alpha<0.01) continue;
+            NSUInteger nativeCount=0,nativeTerminal=0;
+            CALayer *native=cpNativeChoose(w,&nativeCount,&nativeTerminal);
+            if (native) {
+                CGRect r;
+                if (cpNativeRailRect(native,w,&r)) {
+                    [targets addObject:native];
+                    NSUInteger slotVisits=0;
+                    cpNativeSlotArtwork(w.layer,w,native,r,targets,0,&slotVisits);
+                    cpTransientReport=[NSString stringWithFormat:
+                        @"Reels portrait v5 native UFI: counted=%lu terminals=%lu matched=%@ rect=%@ layers=%lu",
+                        (unsigned long)nativeCount,(unsigned long)nativeTerminal,cpNativeOwner(native),
+                        NSStringFromCGRect(r),(unsigned long)targets.count];
+                    continue;
+                }
+            }
             NSMutableArray<UIView *> *controls=[NSMutableArray array];
             NSMutableArray<UIView *> *candidates=[NSMutableArray array];
             NSMutableArray<UIView *> *diagnostic=[NSMutableArray array];
             BOOL reel=NO;NSUInteger visits=0;
             cpTransientGather(w,w,controls,candidates,diagnostic,&reel,0,&visits);
-            if (!reel) continue;
+            if (!reel) {
+                if (!cpTransientReport) cpTransientReport=[NSString stringWithFormat:
+                    @"Reels portrait v5: no viewer evidence; native counted=%lu terminals=%lu",
+                    (unsigned long)nativeCount,(unsigned long)nativeTerminal];
+                continue;
+            }
             NSMutableArray<CALayer *> *matches=[NSMutableArray array];
             for (UIView *v in candidates) {
                 CGRect r;
@@ -1439,7 +1589,7 @@ static void cpTransientScan(void) {
                     cpAudioRounded(v.layer),v.layer.borderWidth,cpAudioHasPicture(v.layer,0),
                     v.layer.mask!=nil||v.layer.masksToBounds,[candidates containsObject:v]]];
             }
-            if (diagnostic.count||!cpTransientReport) cpTransientReport=[NSString stringWithFormat:@"Reels portrait v3: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
+            if (diagnostic.count||!cpTransientReport) cpTransientReport=[NSString stringWithFormat:@"Reels portrait v5 fallback: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
                 reel,(unsigned long)controls.count,(unsigned long)candidates.count,
                 (unsigned long)matches.count,[info componentsJoinedByString:@"\n"]];
         }
@@ -1557,7 +1707,7 @@ static void cpCaptureManualRail(UIWindow *w) {
     cpManualRailViews(w,w,views,0,&visits);
     cpManualRailLayers(w.layer,w,layers,0,&layerVisits);
     cpManualAudioReport=[NSString stringWithFormat:
-        @"Manual right rail v4: window=%@ audioToggle=%d views=%lu layers=%lu\n%@\n%@\nPrevious automatic scan:\n%@",
+        @"Manual right rail v5: window=%@ audioToggle=%d views=%lu layers=%lu\n%@\n%@\nPrevious automatic scan:\n%@",
         NSStringFromCGRect(w.bounds),enabled(kReelAudio),(unsigned long)views.count,
         (unsigned long)layers.count,[views componentsJoinedByString:@"\n"],
         [layers componentsJoinedByString:@"\n"],cpTransientReport?:@"none"];
