@@ -1,17 +1,20 @@
 ## RyukGram v1.6.0 + Reels author privacy
 
-Four independent switches are now available in the **same Comment Privacy menu**.
+Five independent switches are now available in the **same Comment Privacy menu**.
 Long-press the Instagram **Comments** button to open the sheet:
 
 | Comments section | Reels section |
 | --- | --- |
 | Hide Comment Usernames | Hide Reels Usernames |
 | Hide Comment Avatars | Hide Reels Profile Pictures |
+| — | Hide Reels Audio Thumbnail |
 
 - The original two comment switches and their stored preference keys are unchanged.
 - The Reels switches affect only recognised **Reels video author** UI, not users in comments, ordinary feed posts, profiles, stories or DMs.
 - Reels targeting uses known Instagram native IGSundialViewerUserButton accessors (userNameLabel and profilePictureImageView) and IGSundialViewerUserAttributionView / video-overlay accessors, with conservative fallback matching. It does not hide the whole author panel, caption, music, or interaction buttons.
-- All four switches default OFF for new installations; previous comment preferences are preserved if the app container is retained.
+- All five switches default OFF for new installations; previous comment preferences are preserved if the app container is retained.
+
+The new **Hide Reels Audio Thumbnail** option hides the small cover/Original Audio artwork button at the bottom of the right Reels action rail. It defaults to OFF, is independent of all existing switches, and does not mute audio or hide the left-hand attribution text. It uses a native audio control when identified, or artwork geometry immediately below the Save control within a recognized Reels overlay. Real-device verification is required for Instagram 456.
 
 ### Build RyukGram v1.6.0 and Comment Privacy in a single IPA
 
@@ -37,8 +40,8 @@ A separate iOS Objective-C dynamic library for the RyukGram-patched Instagram IP
 ## What it is designed to do
 
 - Long-press a **Comment** button for 0.55 seconds to open **Comment Privacy**.
-- Toggle two comment switches and two Reels author switches independently.
-- All four switches default to OFF and persist in local app preferences.
+- Toggle two comment switches, two Reels author switches, and the right-rail audio thumbnail independently.
+- All five switches default to OFF and persist in local app preferences.
 - Hide only detected comment author labels and avatar views; retain comments, likes, dates and replies.
 - Restore the view's original alpha when the corresponding setting is disabled.
 
