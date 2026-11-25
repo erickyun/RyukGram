@@ -1252,7 +1252,6 @@ static void cpScheduleReelAudio(UIView *view) {
 static char kTransientPortrait;
 static NSHashTable<CALayer *> *cpTransientLayers;
 static NSTimer *cpTransientTimer;
-static NSString *cpTransientReport;
 static BOOL cpTransientScanning;
 static BOOL cpTransientQueued;
 static CFTimeInterval cpTransientLastScan;
@@ -1297,7 +1296,7 @@ static BOOL cpTransientExcluded(UIView *v) {
            [n containsString:@"socialcontext"]||cpReelAuthorRoot(v);
 }
 static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *controls,
-                              NSMutableArray<UIView *> *candidates, NSMutableArray<UIView *> *diagnostic,
+                              NSMutableArray<UIView *> *candidates,
                               BOOL *reel,
                               NSUInteger depth, NSUInteger *visits) {
     if (depth>25||(*visits)++>4500||!cpTransientVisible(v,w)) return;
@@ -1312,7 +1311,6 @@ static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *
         // Generic image-backed glyphs also establish the vertical rail.
         if (control||cpAudioImageView(v)) [controls addObject:v];
         if (cpTransientSlot(v.layer,w,NULL)&&!cpAudioBookmark(v)) {
-            if (diagnostic.count<32) [diagnostic addObject:v];
             BOOL rounded=cpAudioRounded(v.layer);
             BOOL border=v.layer.borderWidth>=0.5;
             BOOL picture=cpAudioHasPicture(v.layer,0);
@@ -1326,7 +1324,7 @@ static void cpTransientGather(UIView *v, UIWindow *w, NSMutableArray<UIView *> *
                 [candidates addObject:v];
         }
     }
-    for (UIView *c in v.subviews) cpTransientGather(c,w,controls,candidates,diagnostic,reel,depth+1,visits);
+    for (UIView *c in v.subviews) cpTransientGather(c,w,controls,candidates,reel,depth+1,visits);
 }
 static BOOL cpTransientBelow(CGRect r, NSArray<UIView *> *controls, UIWindow *w) {
     NSMutableArray<NSNumber *> *rows=[NSMutableArray array];
@@ -1449,12 +1447,10 @@ static CALayer *cpNativeCommonRail(CALayer *a,CALayer *b,UIWindow *w) {
     }
     return nil;
 }
-static CALayer *cpNativeChoose(UIWindow *w, NSUInteger *countedCount, NSUInteger *terminalCount) {
+static CALayer *cpNativeChoose(UIWindow *w) {
     NSMutableArray<CALayer *> *counted=[NSMutableArray array],*terminal=[NSMutableArray array];
     NSUInteger visits=0;
     cpNativeCollect(w.layer,w,counted,terminal,0,&visits);
-    if (countedCount) *countedCount=counted.count;
-    if (terminalCount) *terminalCount=terminal.count;
     CALayer *best=nil;CGFloat bestY=-CGFLOAT_MAX;
     for (CALayer *candidate in terminal) {
         CGRect r; if (!cpNativeRailRect(candidate,w,&r)) continue;
@@ -1519,32 +1515,21 @@ static void cpTransientScan(void) {
         NSMutableSet<CALayer *> *targets=[NSMutableSet set];
         for (UIWindow *w in [UIApplication sharedApplication].windows) {
             if (!w.isKeyWindow||w.hidden||w.alpha<0.01) continue;
-            NSUInteger nativeCount=0,nativeTerminal=0;
-            CALayer *native=cpNativeChoose(w,&nativeCount,&nativeTerminal);
+            CALayer *native=cpNativeChoose(w);
             if (native) {
                 CGRect r;
                 if (cpNativeRailRect(native,w,&r)) {
                     [targets addObject:native];
                     NSUInteger slotVisits=0;
                     cpNativeSlotArtwork(w.layer,w,native,r,targets,0,&slotVisits);
-                    cpTransientReport=[NSString stringWithFormat:
-                        @"Reels portrait v5 native UFI: counted=%lu terminals=%lu matched=%@ rect=%@ layers=%lu",
-                        (unsigned long)nativeCount,(unsigned long)nativeTerminal,cpNativeOwner(native),
-                        NSStringFromCGRect(r),(unsigned long)targets.count];
                     continue;
                 }
             }
             NSMutableArray<UIView *> *controls=[NSMutableArray array];
             NSMutableArray<UIView *> *candidates=[NSMutableArray array];
-            NSMutableArray<UIView *> *diagnostic=[NSMutableArray array];
             BOOL reel=NO;NSUInteger visits=0;
-            cpTransientGather(w,w,controls,candidates,diagnostic,&reel,0,&visits);
-            if (!reel) {
-                if (!cpTransientReport) cpTransientReport=[NSString stringWithFormat:
-                    @"Reels portrait v5: no viewer evidence; native counted=%lu terminals=%lu",
-                    (unsigned long)nativeCount,(unsigned long)nativeTerminal];
-                continue;
-            }
+            cpTransientGather(w,w,controls,candidates,&reel,0,&visits);
+            if (!reel) continue;
             NSMutableArray<CALayer *> *matches=[NSMutableArray array];
             for (UIView *v in candidates) {
                 CGRect r;
@@ -1578,20 +1563,6 @@ static void cpTransientScan(void) {
                         [targets addObject:l];
                 }
             }
-            // Keep a sanitized diagnostic: class names, geometry and counts
-            // only. No accessibility text, usernames, images or account data.
-            NSMutableArray<NSString *> *info=[NSMutableArray array];
-            for (UIView *v in diagnostic) {
-                if (info.count>=24) break;
-                CGRect r=[v convertRect:v.bounds toView:w];
-                [info addObject:[NSString stringWithFormat:@"%@ parent=%@ %@ rounded=%d border=%.1f picture=%d masked=%d selected=%d",
-                    NSStringFromClass(v.class),NSStringFromClass(v.superview.class),NSStringFromCGRect(r),
-                    cpAudioRounded(v.layer),v.layer.borderWidth,cpAudioHasPicture(v.layer,0),
-                    v.layer.mask!=nil||v.layer.masksToBounds,[candidates containsObject:v]]];
-            }
-            if (diagnostic.count||!cpTransientReport) cpTransientReport=[NSString stringWithFormat:@"Reels portrait v5 fallback: viewer=%d rail=%lu candidates=%lu matched=%lu\n%@",
-                reel,(unsigned long)controls.count,(unsigned long)candidates.count,
-                (unsigned long)matches.count,[info componentsJoinedByString:@"\n"]];
         }
         for (CALayer *l in cpTransientLayers.allObjects)
             if (![targets containsObject:l]) cpTransientSet(l,NO);
@@ -1661,58 +1632,6 @@ static void refresh(void) {
 }
 
 
-// Manual on-screen capture, taken BEFORE the privacy sheet is presented.
-// Keep only class names, parent classes, sizes and drawing flags. Never
-// include text, accessibility labels, image contents or account identifiers.
-static NSString *cpManualAudioReport;
-static void cpManualRailViews(UIView *v, UIWindow *w, NSMutableArray<NSString *> *rows,
-                               NSUInteger depth, NSUInteger *visited) {
-    if (depth>28 || (*visited)++>6000 || rows.count>=90 || !cpTransientVisible(v,w)) return;
-    CGRect r=[v convertRect:v.bounds toView:w];
-    CGRect b=w.bounds;
-    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
-    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
-    if (x>=0.78 && y>=0.40 && y<=0.96 && r.size.width>=8 && r.size.width<=130 &&
-        r.size.height>=8 && r.size.height<=150) {
-        [rows addObject:[NSString stringWithFormat:
-          @"V %@ parent=%@ %@ alpha=%.2f hidden=%d corner=%.1f border=%.1f picture=%d mask=%d",
-          NSStringFromClass(v.class),NSStringFromClass(v.superview.class),NSStringFromCGRect(r),
-          v.alpha,v.hidden,v.layer.cornerRadius,v.layer.borderWidth,
-          cpAudioHasPicture(v.layer,0),v.layer.mask!=nil]];
-    }
-    for (UIView *child in v.subviews) cpManualRailViews(child,w,rows,depth+1,visited);
-}
-static void cpManualRailLayers(CALayer *l, UIWindow *w, NSMutableArray<NSString *> *rows,
-                                NSUInteger depth, NSUInteger *visited) {
-    if (depth>30||(*visited)++>8000||rows.count>=65) return;
-    CGRect r=[l convertRect:l.bounds toLayer:w.layer];
-    CGRect b=w.bounds;
-    CGFloat x=(CGRectGetMidX(r)-CGRectGetMinX(b))/b.size.width;
-    CGFloat y=(CGRectGetMidY(r)-CGRectGetMinY(b))/b.size.height;
-    if (x>=0.82&&y>=0.58&&y<=0.96&&r.size.width>=12&&r.size.width<=85&&
-        r.size.height>=12&&r.size.height<=85) {
-        id owner=l.delegate;
-        [rows addObject:[NSString stringWithFormat:
-          @"L %@ owner=%@ %@ opacity=%.2f hidden=%d corner=%.1f border=%.1f contents=%d mask=%d",
-          NSStringFromClass(l.class),owner?NSStringFromClass([owner class]):@"none",
-          NSStringFromCGRect(r),l.opacity,l.hidden,l.cornerRadius,l.borderWidth,
-          l.contents!=nil,l.mask!=nil]];
-    }
-    for (CALayer *child in l.sublayers) cpManualRailLayers(child,w,rows,depth+1,visited);
-}
-static void cpCaptureManualRail(UIWindow *w) {
-    if (!w || ![NSThread isMainThread]) return;
-    NSMutableArray<NSString *> *views=[NSMutableArray array],*layers=[NSMutableArray array];
-    NSUInteger visits=0,layerVisits=0;
-    cpManualRailViews(w,w,views,0,&visits);
-    cpManualRailLayers(w.layer,w,layers,0,&layerVisits);
-    cpManualAudioReport=[NSString stringWithFormat:
-        @"Manual right rail v5: window=%@ audioToggle=%d views=%lu layers=%lu\n%@\n%@\nPrevious automatic scan:\n%@",
-        NSStringFromCGRect(w.bounds),enabled(kReelAudio),(unsigned long)views.count,
-        (unsigned long)layers.count,[views componentsJoinedByString:@"\n"],
-        [layers componentsJoinedByString:@"\n"],cpTransientReport?:@"none"];
-}
-
 @interface CPMenu : UITableViewController
 @end
 @implementation CPMenu
@@ -1720,9 +1639,6 @@ static void cpCaptureManualRail(UIWindow *w) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Comment Privacy";
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc]
-        initWithTitle:@"Audio Debug" style:UIBarButtonItemStylePlain
-        target:self action:@selector(copyAudioDebug)];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
         initWithBarButtonSystemItem:UIBarButtonSystemItemDone
         target:self action:@selector(closeMenu)];
@@ -1777,14 +1693,6 @@ static void cpCaptureManualRail(UIWindow *w) {
                                             forKey:sw.accessibilityIdentifier];
     refresh();
 }
-- (void)copyAudioDebug {
-    [UIPasteboard generalPasteboard].string = cpManualAudioReport ?: cpTransientReport ?: @"Reels portrait v4: no visible Reels scan yet";
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Audio diagnostics copied"
-        message:@"Paste this report if the right-hand portrait is still visible. It contains only view classes and geometry."
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
-}
 - (void)closeMenu { [self dismissViewControllerAnimated:YES completion:nil]; }
 @end
 
@@ -1825,8 +1733,6 @@ static UIViewController *topController(void) {
         ([top isKindOfClass:[UINavigationController class]] &&
          [[(UINavigationController *)top topViewController] isKindOfClass:[CPMenu class]]))
         return;
-    if (press.numberOfTouchesRequired==2 || cpAudioScope(press.view) || cpAudioScope(press.view.superview))
-        cpCaptureManualRail(press.view.window ?: ([press.view isKindOfClass:[UIWindow class]] ? (UIWindow *)press.view : nil));
     UINavigationController *nav = [[UINavigationController alloc]
         initWithRootViewController:[[CPMenu alloc] init]];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
@@ -2025,7 +1931,6 @@ __attribute__((constructor)) static void initializeCommentPrivacy(void) {
             for (UIWindow *w in [UIApplication sharedApplication].windows)
                 cpInstallWindowPrivacyGesture(w);
             cpTransientUpdateTimer();
-            NSLog(@"[CommentPrivacy] loaded; five toggles; two-finger menu and manual audio diagnostics v4");
         });
     }
 }
