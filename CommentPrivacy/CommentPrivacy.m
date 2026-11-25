@@ -1578,6 +1578,8 @@ static BOOL cpNativeRetained(CALayer *l) {
 }
 static void cpNativeRemember(CALayer *l) {
     if (!l.superlayer) return;
+    NSHashTable<CALayer *> *existing=objc_getAssociatedObject(l,&kNativeSlotParent);
+    if ([existing containsObject:l.superlayer]) return;
     NSHashTable<CALayer *> *parent=[NSHashTable weakObjectsHashTable];
     [parent addObject:l.superlayer];
     objc_setAssociatedObject(l,&kNativeSlotParent,parent,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
